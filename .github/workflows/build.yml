@@ -33,6 +33,9 @@ jobs:
         run: gradle build --stacktrace
 
       - name: Generate actual patch list
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gradle :patches:generatePatchesList --stacktrace
           echo "=== GENERATED PATCH LIST ==="
