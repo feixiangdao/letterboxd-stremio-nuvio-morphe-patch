@@ -28,7 +28,7 @@ dependencies {
 }
 
 tasks.register<JavaExec>("generatePatchesList") {
-    dependsOn(build)
+    dependsOn("build")
     classpath = sourceSets["main"].runtimeClasspath + patchListGeneratorClasspath
     mainClass.set("util.PatchListGeneratorKt")
 }
