@@ -26,35 +26,35 @@ jobs:
         with:
           gradle-version: "9.5.0"
 
-      - name: Build patch bundle
+      - name: Generate patch metadata
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gradle build --stacktrace
+        run: gradle :patches:generatePatchesList --stacktrace
 
-      - name: Generate actual patch list
+      - name: Build Android patch bundle
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gradle :patches:buildAndroid --stacktrace
+
+      - name: Verify Android bundle
         run: |
-          gradle :patches:generatePatchesList --stacktrace
           echo "=== GENERATED PATCH LIST ==="
-          cat patches-list.json || true
-
-      - name: Show build outputs
-        run: |
-          find . -type f \( -name "*.mpp" -o -name "*.mpe" \) -print
-          MPP="$(find patches/build/libs -maxdepth 1 -type f -name '*.mpp' | head -n 1)"
+          cat patches-list.json
+          MPP="$(find patches/build/libs -maxdepth 1 -type f -name '*.mpp' ! -name '*sources*' ! -name '*javadoc*' | head -n 1)"
+          test -n "$MPP"
           echo "=== MPP MANIFEST ==="
-          unzip -p "$MPP" META-INF/MANIFEST.MF || true
+          unzip -p "$MPP" META-INF/MANIFEST.MF
+          echo "=== DEX ENTRIES ==="
+          unzip -l "$MPP" | grep -Ei '\.dex$'
           echo "=== MPP CONTENTS ==="
           unzip -l "$MPP" | sed -n '1,120p'
 
       - name: Upload patch artifact
         uses: actions/upload-artifact@v4
         with:
-          name: letterboxd-player-bridge
+          name: letterboxd-player-bridge-android
           path: |
-            patches/build/libs/*.mpp
-            extensions/extension/build/libs/*.mpe
+            patches/build/libs/patches-*.mpp
           if-no-files-found: error
