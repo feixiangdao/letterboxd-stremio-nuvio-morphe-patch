@@ -17,3 +17,18 @@ kotlin {
         freeCompilerArgs.add("-Xcontext-parameters")
     }
 }
+
+
+// Diagnostic generator copied from the upstream template.
+val patchListGeneratorClasspath: Configuration by configurations.creating
+
+dependencies {
+    compileOnly(libs.gson)
+    patchListGeneratorClasspath(libs.gson)
+}
+
+tasks.register<JavaExec>("generatePatchesList") {
+    dependsOn(build)
+    classpath = sourceSets["main"].runtimeClasspath + patchListGeneratorClasspath
+    mainClass.set("util.PatchListGeneratorKt")
+}
