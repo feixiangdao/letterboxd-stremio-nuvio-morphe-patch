@@ -7,9 +7,15 @@ on:
         description: Version without the leading v
         required: true
         default: "0.1.0"
+  push:
+    paths:
+      - ".github/release-trigger"
 
 permissions:
   contents: write
+
+env:
+  RELEASE_VERSION: ${{ inputs.version || '0.1.0' }}
 
 jobs:
   publish:
@@ -32,7 +38,7 @@ jobs:
           gradle-version: "9.5.0"
 
       - name: Set version
-        run: sed -i "s/^version=.*/version=${{ inputs.version }}/" gradle.properties
+        run: sed -i "s/^version=.*/version=${RELEASE_VERSION}/" gradle.properties
 
       - name: Build
         env:
@@ -44,7 +50,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${{ inputs.version }}"
+          VERSION="${RELEASE_VERSION}"
           SOURCE="$(find patches/build/libs -maxdepth 1 -type f -name '*.mpp' | head -n 1)"
           test -n "$SOURCE"
           ASSET="patches-${VERSION}.mpp"
@@ -97,7 +103,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${{ inputs.version }}"
+          VERSION="${RELEASE_VERSION}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add gradle.properties patches-list.json patches-bundle.json
@@ -113,7 +119,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          VERSION="${{ inputs.version }}"
+          VERSION="${RELEASE_VERSION}"
           gh release delete "v${VERSION}" --yes || true
           gh release create "v${VERSION}" "patches-${VERSION}.mpp" \
             --title "v${VERSION}" --generate-notes
