@@ -32,6 +32,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gradle build --stacktrace
 
+      - name: Generate actual patch list
+        run: |
+          gradle :patches:generatePatchesList --stacktrace
+          echo "=== GENERATED PATCH LIST ==="
+          cat patches-list.json || true
+
       - name: Show build outputs
         run: |
           find . -type f \( -name "*.mpp" -o -name "*.mpe" \) -print
