@@ -91,10 +91,11 @@ jobs:
 
           cat > patches-bundle.json <<EOF
           {
-            "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "created_at": "$(date -u +%Y-%m-%dT%H:%M:%S)",
             "description": "Letterboxd Player Bridge ${VERSION}: separate Stremio and Nuvio buttons.",
             "download_url": "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/${ASSET}",
             "signature_download_url": "",
+            "page_url": "https://github.com/${{ github.repository }}/releases/tag/v${VERSION}",
             "version": "v${VERSION}"
           }
           EOF
