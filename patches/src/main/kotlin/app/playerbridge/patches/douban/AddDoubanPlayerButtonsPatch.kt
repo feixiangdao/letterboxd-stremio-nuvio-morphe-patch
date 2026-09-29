@@ -21,7 +21,7 @@ val addDoubanPlayerButtonsPatch = bytecodePatch(
     name = "Add Stremio + Nuvio buttons (Douban)",
     description = "Adds independent Stremio and Nuvio buttons to Douban 7.135.0 " +
         "using a delayed Application lifecycle hook.",
-    default = true,
+    default = false,
 ) {
     compatibleWith(COMPATIBILITY_DOUBAN)
 
@@ -61,7 +61,7 @@ val doubanRepackagingProbePatch = bytecodePatch(
     name = "Diagnostic: Douban repackaging only",
     description = "Makes no functional changes. Use only to test whether this " +
         "Douban build accepts a Morphe-rebuilt/re-signed APK.",
-    default = false,
+    default = true,
 ) {
     compatibleWith(COMPATIBILITY_DOUBAN)
 
