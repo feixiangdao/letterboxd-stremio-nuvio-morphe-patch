@@ -1,10 +1,10 @@
 package com.feixiangdao.doubanplayerbridge;
 
 import android.accessibilityservice.AccessibilityService;
-import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.ResolveInfo;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
@@ -45,7 +45,6 @@ public class DoubanAccessibilityService extends AccessibilityService {
             "com.feixiangdao.doubanplayerbridge";
     private static final String NUVIO_PACKAGE = "com.nuvio.app";
     private static final String NUVIO_ACTIVITY = "com.nuvio.app.MainActivity";
-    private static final String STREMIO_PACKAGE = "com.stremio.one";
 
     private static final long HIDE_GRACE_MS = 2600L;
 
@@ -73,11 +72,14 @@ public class DoubanAccessibilityService extends AccessibilityService {
     private TextView overlayStatus;
     private TextView stremioButton;
     private TextView nuvioButton;
+    private TextView infoButton;
 
     private MediaInfo currentInfo;
     private TmdbResolver.Result currentResolved;
     private String currentResolveKey;
+    private String resolveDiagnostic = "尚未开始匹配";
     private boolean resolving;
+    private boolean imdbLoading;
 
     private String lastDoubanWindowClass;
     private long lastDoubanEventAt;
@@ -89,7 +91,6 @@ public class DoubanAccessibilityService extends AccessibilityService {
     protected void onServiceConnected() {
         super.onServiceConnected();
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
-        Log.d(TAG, "Accessibility service connected");
     }
 
     @Override
@@ -112,7 +113,7 @@ public class DoubanAccessibilityService extends AccessibilityService {
             }
 
             main.removeCallbacks(scanRunnable);
-            main.postDelayed(scanRunnable, 350);
+            main.postDelayed(scanRunnable, 320);
             return;
         }
 
@@ -167,13 +168,14 @@ public class DoubanAccessibilityService extends AccessibilityService {
         String oldKey = currentInfo == null ? null : currentInfo.cacheKey();
         String newKey = info.cacheKey();
         currentInfo = info;
-
-        showOrUpdateOverlay(info);
+        showOrUpdateOverlay();
 
         if (!newKey.equals(oldKey)) {
             currentResolved = null;
-            currentResolveKey = null;
+            currentResolveKey = newKey;
+            resolveDiagnostic = "等待 TMDB 匹配";
             resolving = false;
+            imdbLoading = false;
             beginPreResolve(info);
         } else {
             updateOverlayState();
@@ -207,66 +209,57 @@ public class DoubanAccessibilityService extends AccessibilityService {
         int screenHeight = dm.heightPixels;
         int maxTitleArea = (int) (screenHeight * 0.52f);
 
-        List<NodeText> exactYearAnchors = new ArrayList<>();
+        List<NodeText> yearAnchors = new ArrayList<>();
         for (NodeText entry : entries) {
             int y = entry.bounds.centerY();
             if (y <= 0 || y > maxTitleArea) continue;
             if (EXACT_YEAR.matcher(entry.text.trim()).matches()) {
-                exactYearAnchors.add(entry);
+                yearAnchors.add(entry);
             }
         }
-        exactYearAnchors.sort(
-                Comparator.comparingInt(a -> a.bounds.centerY()));
+        yearAnchors.sort(Comparator.comparingInt(a -> a.bounds.centerY()));
 
         NodeText bestTitle = null;
-        NodeText bestYearAnchor = null;
-        int bestPairScore = Integer.MIN_VALUE;
+        NodeText bestYear = null;
+        int bestScore = Integer.MIN_VALUE;
 
-        // First choice: a real title visually paired with a standalone (YYYY).
-        for (NodeText anchor : exactYearAnchors) {
+        for (NodeText anchor : yearAnchors) {
             for (NodeText candidate : entries) {
                 if (candidate == anchor) continue;
                 String title = cleanTitle(candidate.text);
                 if (!looksLikeTitle(title)) continue;
 
-                int candidateY = candidate.bounds.centerY();
-                if (candidateY <= 0 || candidateY >= anchor.bounds.centerY()) {
-                    continue;
-                }
+                int cy = candidate.bounds.centerY();
+                if (cy <= 0 || cy >= anchor.bounds.centerY()) continue;
 
                 int gap = anchor.bounds.top - candidate.bounds.bottom;
-                if (gap < -dp(18) || gap > dp(170)) continue;
+                if (gap < -dp(22) || gap > dp(180)) continue;
 
-                int horizontalDistance = Math.abs(
+                int horizontal = Math.abs(
                         candidate.bounds.left - anchor.bounds.left);
-                if (horizontalDistance > dm.widthPixels * 0.52f) continue;
+                if (horizontal > dm.widthPixels * 0.58f) continue;
 
-                int score = 300;
+                int score = 320;
                 score -= Math.max(0, gap);
-                score -= horizontalDistance / 5;
+                score -= horizontal / 6;
                 score += Math.min(100, candidate.bounds.height() * 2);
-                score += Math.min(60, candidate.bounds.width() / 5);
+                score += Math.min(65, candidate.bounds.width() / 5);
 
                 String id = candidate.viewId == null ? "" :
                         candidate.viewId.toLowerCase(Locale.US);
                 if (id.contains("title")) score += 100;
                 if (id.contains("subject")) score += 30;
 
-                if (score > bestPairScore) {
-                    bestPairScore = score;
+                if (score > bestScore) {
+                    bestScore = score;
                     bestTitle = candidate;
-                    bestYearAnchor = anchor;
+                    bestYear = anchor;
                 }
             }
-
-            // The first standalone year near the top is normally the title year.
             if (bestTitle != null) break;
         }
 
-        // Fallback only when the title/year pair is not exposed as separate
-        // accessibility nodes. Prefer explicit title resource IDs.
         if (bestTitle == null) {
-            int bestScore = Integer.MIN_VALUE;
             for (NodeText entry : entries) {
                 int y = entry.bounds.centerY();
                 if (y <= 0 || y > maxTitleArea) continue;
@@ -278,12 +271,12 @@ public class DoubanAccessibilityService extends AccessibilityService {
                         entry.viewId.toLowerCase(Locale.US);
 
                 int score = 0;
-                if (id.contains("title")) score += 220;
-                if (id.contains("subject")) score += 60;
-                if (id.contains("name")) score += 30;
-                score += Math.min(90, entry.bounds.height() * 2);
-                score += Math.min(50, entry.bounds.width() / 6);
-                if (y < screenHeight * 0.35f) score += 40;
+                if (id.contains("title")) score += 240;
+                if (id.contains("subject")) score += 70;
+                if (id.contains("name")) score += 35;
+                score += Math.min(95, entry.bounds.height() * 2);
+                score += Math.min(55, entry.bounds.width() / 6);
+                if (y < screenHeight * 0.35f) score += 45;
 
                 if (score > bestScore) {
                     bestScore = score;
@@ -296,39 +289,38 @@ public class DoubanAccessibilityService extends AccessibilityService {
 
         MediaInfo info = new MediaInfo();
         info.title = cleanTitle(bestTitle.text);
+        info.year = bestYear != null
+                ? parseYear(bestYear.text)
+                : parseYear(bestTitle.text);
 
-        if (bestYearAnchor != null) {
-            info.year = parseYear(bestYearAnchor.text);
-        } else {
-            info.year = parseYear(bestTitle.text);
-            if (info.year == null && !exactYearAnchors.isEmpty()) {
-                info.year = parseYear(exactYearAnchors.get(0).text);
-            }
+        if (info.year == null && !yearAnchors.isEmpty()) {
+            info.year = parseYear(yearAnchors.get(0).text);
         }
 
-        // Nearby text may contain an English/original title. Keep only a few
-        // spatially close aliases for TMDB exact-name comparison.
-        List<NodeText> aliases = new ArrayList<>();
         final NodeText titleNode = bestTitle;
+        List<NodeText> nearby = new ArrayList<>();
+
         for (NodeText entry : entries) {
-            if (entry == bestTitle || entry == bestYearAnchor) continue;
+            if (entry == bestTitle || entry == bestYear) continue;
+
             int y = entry.bounds.centerY();
             if (y <= 0 || y > screenHeight * 0.56f) continue;
-            if (Math.abs(y - bestTitle.bounds.centerY()) > dp(150)) continue;
+            if (Math.abs(y - bestTitle.bounds.centerY()) > dp(155)) continue;
 
             String value = cleanTitle(entry.text);
             if (!looksLikeTitle(value) || value.equals(info.title)) continue;
             if (EXACT_YEAR.matcher(entry.text.trim()).matches()) continue;
-            aliases.add(entry);
+
+            nearby.add(entry);
         }
 
-        aliases.sort(Comparator.comparingInt(a ->
+        nearby.sort(Comparator.comparingInt(a ->
                 Math.abs(a.bounds.centerY() - titleNode.bounds.centerY())));
 
-        for (NodeText alias : aliases) {
-            String value = cleanTitle(alias.text);
+        for (NodeText entry : nearby) {
+            String value = cleanTitle(entry.text);
             if (!info.aliases.contains(value)) info.aliases.add(value);
-            if (info.aliases.size() >= 3) break;
+            if (info.aliases.size() >= 4) break;
         }
 
         boolean series = false;
@@ -346,45 +338,49 @@ public class DoubanAccessibilityService extends AccessibilityService {
     }
 
     private void beginPreResolve(MediaInfo info) {
-        String credential = getSharedPreferences(
-                MainActivity.SETTINGS_PREFS, MODE_PRIVATE)
-                .getString(MainActivity.TMDB_CREDENTIAL_KEY, "")
-                .trim();
-
+        String credential = tmdbCredential();
         currentResolveKey = info.cacheKey();
 
         if (TextUtils.isEmpty(credential)) {
             resolving = false;
             currentResolved = null;
+            resolveDiagnostic = "TMDB Key 未设置";
             updateOverlayState();
             return;
         }
 
         TmdbResolver.Result cached = readTmdbCache(info);
         if (cached != null) {
-            resolving = false;
             currentResolved = cached;
+            resolving = false;
+            resolveDiagnostic = "使用本地缓存：TMDB " + cached.tmdbId;
             updateOverlayState();
+
+            if (TextUtils.isEmpty(cached.imdbId)) {
+                fetchImdbInBackground(info, cached, credential);
+            }
             return;
         }
 
         resolving = true;
         currentResolved = null;
+        resolveDiagnostic = "TMDB 搜索中…";
         updateOverlayState();
 
         final String expectedKey = currentResolveKey;
         worker.execute(() -> {
-            TmdbResolver.Result result = null;
-            Throwable failure = null;
+            TmdbResolver.Lookup lookup;
             try {
-                result = TmdbResolver.resolve(info, credential);
+                lookup = TmdbResolver.resolveFast(info, credential);
             } catch (Throwable error) {
-                failure = error;
+                lookup = new TmdbResolver.Lookup(
+                        null,
+                        compactError(error)
+                );
                 Log.w(TAG, "TMDB resolve failed", error);
             }
 
-            TmdbResolver.Result finalResult = result;
-            Throwable finalFailure = failure;
+            final TmdbResolver.Lookup finalLookup = lookup;
             main.post(() -> {
                 if (currentInfo == null ||
                         !expectedKey.equals(currentInfo.cacheKey())) {
@@ -392,13 +388,63 @@ public class DoubanAccessibilityService extends AccessibilityService {
                 }
 
                 resolving = false;
-                currentResolved = finalResult;
+                currentResolved = finalLookup.result;
+                resolveDiagnostic = finalLookup.message;
 
-                if (finalResult != null) {
-                    writeTmdbCache(info, finalResult);
-                } else if (finalFailure != null) {
-                    Log.w(TAG, "TMDB lookup produced no result", finalFailure);
+                if (currentResolved != null) {
+                    writeTmdbCache(info, currentResolved);
                 }
+
+                updateOverlayState();
+
+                if (currentResolved != null) {
+                    fetchImdbInBackground(
+                            info,
+                            currentResolved,
+                            credential
+                    );
+                }
+            });
+        });
+    }
+
+    private void fetchImdbInBackground(
+            MediaInfo info,
+            TmdbResolver.Result base,
+            String credential
+    ) {
+        if (imdbLoading || base == null || !TextUtils.isEmpty(base.imdbId)) {
+            return;
+        }
+
+        imdbLoading = true;
+        final String expectedKey = info.cacheKey();
+        final long expectedTmdb = base.tmdbId;
+
+        worker.execute(() -> {
+            String imdb = null;
+            try {
+                imdb = TmdbResolver.fetchImdbId(base, credential);
+            } catch (Throwable error) {
+                Log.w(TAG, "IMDb external-id fetch failed", error);
+            }
+
+            final String finalImdb = imdb;
+            main.post(() -> {
+                imdbLoading = false;
+
+                if (currentInfo == null ||
+                        !expectedKey.equals(currentInfo.cacheKey()) ||
+                        currentResolved == null ||
+                        currentResolved.tmdbId != expectedTmdb) {
+                    return;
+                }
+
+                if (!TextUtils.isEmpty(finalImdb)) {
+                    currentResolved = currentResolved.withImdb(finalImdb);
+                    writeTmdbCache(currentInfo, currentResolved);
+                }
+
                 updateOverlayState();
             });
         });
@@ -410,71 +456,80 @@ public class DoubanAccessibilityService extends AccessibilityService {
         String media = currentInfo.title +
                 (currentInfo.year == null ? "" : " (" + currentInfo.year + ")");
 
-        String credential = getSharedPreferences(
-                MainActivity.SETTINGS_PREFS, MODE_PRIVATE)
-                .getString(MainActivity.TMDB_CREDENTIAL_KEY, "")
-                .trim();
-
-        if (TextUtils.isEmpty(credential)) {
+        if (TextUtils.isEmpty(tmdbCredential())) {
             overlayStatus.setText(media + " · 请先设置 TMDB Key");
-            setButtonEnabled(stremioButton, true);
-            setButtonEnabled(nuvioButton, false);
+            styleReady(stremioButton, true);
+            styleReady(nuvioButton, false);
             return;
         }
 
         if (resolving) {
             overlayStatus.setText(media + " · TMDB 匹配中…");
-            setButtonEnabled(stremioButton, false);
-            setButtonEnabled(nuvioButton, false);
+            styleReady(stremioButton, false);
+            styleReady(nuvioButton, false);
             return;
         }
 
         if (currentResolved == null) {
-            overlayStatus.setText(media + " · 未找到可靠匹配");
-            setButtonEnabled(stremioButton, true);
-            setButtonEnabled(nuvioButton, false);
+            overlayStatus.setText(media + " · " + resolveDiagnostic);
+            styleReady(stremioButton, true);
+            styleReady(nuvioButton, false);
             return;
         }
 
-        String resolvedTitle = TextUtils.isEmpty(currentResolved.title)
-                ? media : currentResolved.title;
         overlayStatus.setText(
-                media + " → " + resolvedTitle +
+                media + " → " + currentResolved.title +
                         " · TMDB " + currentResolved.tmdbId
         );
 
-        setButtonEnabled(stremioButton, true);
-        setButtonEnabled(nuvioButton, true);
+        styleReady(stremioButton, true);
+        styleReady(nuvioButton, true);
     }
 
-    private void setButtonEnabled(TextView button, boolean enabled) {
+    /**
+     * Keep controls clickable even when visually "not ready" so users always
+     * receive an immediate explanatory Toast instead of a dead button.
+     */
+    private void styleReady(TextView button, boolean ready) {
         if (button == null) return;
-        button.setEnabled(enabled);
-        button.setAlpha(enabled ? 1.0f : 0.42f);
+        button.setEnabled(true);
+        button.setAlpha(ready ? 1.0f : 0.42f);
     }
 
     private void onStremioClick() {
-        MediaInfo info = currentInfo;
-        if (info == null) return;
+        if (currentInfo == null) {
+            Toast.makeText(this, "尚未识别当前影片", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        if (resolving) {
+            Toast.makeText(this, "TMDB 正在匹配，请稍候", Toast.LENGTH_SHORT).show();
+            return;
+        }
 
         if (currentResolved != null &&
                 !TextUtils.isEmpty(currentResolved.imdbId)) {
             String uri = "series".equals(currentResolved.type)
                     ? "stremio:///detail/series/" + currentResolved.imdbId
                     : "stremio:///detail/movie/" + currentResolved.imdbId +
-                        "/" + currentResolved.imdbId;
+                    "/" + currentResolved.imdbId;
             launchStremio(uri);
             return;
         }
 
-        openStremioSearch(info);
+        openStremioSearch(currentInfo);
     }
 
     private void onNuvioClick() {
+        if (resolving) {
+            Toast.makeText(this, "TMDB 正在匹配，请稍候", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
         if (currentResolved == null) {
             Toast.makeText(
                     this,
-                    resolving ? "TMDB 仍在匹配，请稍候" : "没有可靠 TMDB 匹配",
+                    "Nuvio 未启用：没有可靠 TMDB 匹配",
                     Toast.LENGTH_SHORT
             ).show();
             return;
@@ -500,10 +555,10 @@ public class DoubanAccessibilityService extends AccessibilityService {
 
         try {
             startActivity(intent);
-        } catch (Throwable error) {
+        } catch (Throwable first) {
             try {
                 Intent fallback = new Intent(Intent.ACTION_VIEW, uri);
-                fallback.setPackage(NUVIO_PACKAGE);
+                fallback.setClassName(NUVIO_PACKAGE, NUVIO_ACTIVITY);
                 fallback.addFlags(
                         Intent.FLAG_ACTIVITY_NEW_TASK |
                         Intent.FLAG_ACTIVITY_CLEAR_TOP |
@@ -521,18 +576,46 @@ public class DoubanAccessibilityService extends AccessibilityService {
     }
 
     private void launchStremio(String uri) {
-        try {
-            Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(uri));
-            intent.setPackage(STREMIO_PACKAGE);
-            intent.addFlags(
-                    Intent.FLAG_ACTIVITY_NEW_TASK |
-                    Intent.FLAG_ACTIVITY_CLEAR_TOP |
-                    Intent.FLAG_ACTIVITY_SINGLE_TOP
-            );
-            startActivity(intent);
-        } catch (Throwable error) {
+        Intent base = new Intent(Intent.ACTION_VIEW, Uri.parse(uri));
+        base.addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK |
+                Intent.FLAG_ACTIVITY_CLEAR_TOP |
+                Intent.FLAG_ACTIVITY_SINGLE_TOP
+        );
+
+        String packageName = resolveStremioPackage(base);
+        if (packageName == null) {
             Toast.makeText(this, "没有检测到 Stremio", Toast.LENGTH_LONG).show();
+            return;
         }
+
+        base.setPackage(packageName);
+        try {
+            startActivity(base);
+        } catch (Throwable error) {
+            Toast.makeText(
+                    this,
+                    "Stremio 跳转失败：" + error.getClass().getSimpleName(),
+                    Toast.LENGTH_LONG
+            ).show();
+        }
+    }
+
+    private String resolveStremioPackage(Intent intent) {
+        List<ResolveInfo> handlers = getPackageManager()
+                .queryIntentActivities(intent, 0);
+
+        String fallback = null;
+        for (ResolveInfo info : handlers) {
+            if (info.activityInfo == null) continue;
+            String pkg = info.activityInfo.packageName;
+            if (NUVIO_PACKAGE.equals(pkg) || SELF_PACKAGE.equals(pkg)) continue;
+
+            String lower = pkg.toLowerCase(Locale.US);
+            if (lower.contains("stremio")) return pkg;
+            if (fallback == null) fallback = pkg;
+        }
+        return fallback;
     }
 
     private void openStremioSearch(MediaInfo info) {
@@ -551,11 +634,12 @@ public class DoubanAccessibilityService extends AccessibilityService {
         }
     }
 
-    private void showOrUpdateOverlay(MediaInfo info) {
+    private void showOrUpdateOverlay() {
         if (windowManager == null) return;
 
         if (overlay == null) {
             overlay = buildOverlay();
+
             WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
                     WindowManager.LayoutParams.WRAP_CONTENT,
                     WindowManager.LayoutParams.WRAP_CONTENT,
@@ -583,7 +667,7 @@ public class DoubanAccessibilityService extends AccessibilityService {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
         card.setGravity(Gravity.CENTER);
-        card.setPadding(dp(10), dp(8), dp(10), dp(8));
+        card.setPadding(dp(9), dp(7), dp(9), dp(7));
 
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(0xF2FFFFFF);
@@ -597,11 +681,11 @@ public class DoubanAccessibilityService extends AccessibilityService {
         overlayStatus.setTextColor(0xFF333333);
         overlayStatus.setGravity(Gravity.CENTER);
         overlayStatus.setMaxLines(2);
-        overlayStatus.setPadding(dp(6), 0, dp(6), dp(6));
+        overlayStatus.setPadding(dp(6), 0, dp(6), dp(5));
         card.addView(
                 overlayStatus,
                 new LinearLayout.LayoutParams(
-                        dp(250),
+                        dp(280),
                         LinearLayout.LayoutParams.WRAP_CONTENT)
         );
 
@@ -611,48 +695,63 @@ public class DoubanAccessibilityService extends AccessibilityService {
 
         stremioButton = makeButton("Stremio", 0xFF7B5EA7);
         nuvioButton = makeButton("Nuvio", 0xFF25282D);
+        infoButton = makeButton("ⓘ", 0xFF5D6470);
 
-        LinearLayout.LayoutParams first = new LinearLayout.LayoutParams(
-                dp(112), dp(42));
-        first.rightMargin = dp(7);
-        row.addView(stremioButton, first);
-        row.addView(nuvioButton,
-                new LinearLayout.LayoutParams(dp(98), dp(42)));
+        LinearLayout.LayoutParams stremioLp =
+                new LinearLayout.LayoutParams(dp(108), dp(42));
+        stremioLp.rightMargin = dp(7);
+        row.addView(stremioButton, stremioLp);
+
+        LinearLayout.LayoutParams nuvioLp =
+                new LinearLayout.LayoutParams(dp(92), dp(42));
+        nuvioLp.rightMargin = dp(7);
+        row.addView(nuvioButton, nuvioLp);
+
+        row.addView(
+                infoButton,
+                new LinearLayout.LayoutParams(dp(46), dp(42))
+        );
 
         card.addView(row);
 
         stremioButton.setOnClickListener(v -> onStremioClick());
         nuvioButton.setOnClickListener(v -> onNuvioClick());
-
-        View.OnLongClickListener debug = v -> {
-            StringBuilder message = new StringBuilder();
-            if (currentInfo != null) {
-                message.append(currentInfo.debugText());
-            } else {
-                message.append("尚未识别影片");
-            }
-
-            if (currentResolved != null) {
-                message.append("\nTMDB: ")
-                        .append(currentResolved.tmdbId)
-                        .append("\nTMDB标题: ")
-                        .append(currentResolved.title)
-                        .append("\nIMDb: ")
-                        .append(TextUtils.isEmpty(currentResolved.imdbId)
-                                ? "?" : currentResolved.imdbId);
-            }
-
-            Toast.makeText(
-                    this,
-                    message.toString(),
-                    Toast.LENGTH_LONG
-            ).show();
-            return true;
-        };
-        stremioButton.setOnLongClickListener(debug);
-        nuvioButton.setOnLongClickListener(debug);
+        infoButton.setOnClickListener(v -> showDebugInfo());
+        overlayStatus.setOnClickListener(v -> showDebugInfo());
 
         return card;
+    }
+
+    private void showDebugInfo() {
+        StringBuilder message = new StringBuilder();
+
+        if (currentInfo != null) {
+            message.append(currentInfo.debugText());
+        } else {
+            message.append("尚未识别影片");
+        }
+
+        message.append("\n状态: ").append(resolveDiagnostic);
+
+        if (currentResolved != null) {
+            message.append("\nTMDB: ")
+                    .append(currentResolved.tmdbId)
+                    .append("\nTMDB标题: ")
+                    .append(currentResolved.title)
+                    .append("\nTMDB年份: ")
+                    .append(currentResolved.year == null
+                            ? "?" : currentResolved.year)
+                    .append("\nIMDb: ")
+                    .append(TextUtils.isEmpty(currentResolved.imdbId)
+                            ? (imdbLoading ? "同步中…" : "?")
+                            : currentResolved.imdbId);
+        }
+
+        Toast.makeText(
+                this,
+                message.toString(),
+                Toast.LENGTH_LONG
+        ).show();
     }
 
     private TextView makeButton(String label, int color) {
@@ -670,8 +769,15 @@ public class DoubanAccessibilityService extends AccessibilityService {
         return v;
     }
 
+    private String tmdbCredential() {
+        return getSharedPreferences(
+                MainActivity.SETTINGS_PREFS,
+                MODE_PRIVATE
+        ).getString(MainActivity.TMDB_CREDENTIAL_KEY, "").trim();
+    }
+
     private TmdbResolver.Result readTmdbCache(MediaInfo info) {
-        String raw = cachePrefs().getString("tmdb4:" + info.cacheKey(), null);
+        String raw = cachePrefs().getString("tmdb5:" + info.cacheKey(), null);
         if (raw == null) return null;
 
         String[] parts = raw.split("\\|", 5);
@@ -687,7 +793,7 @@ public class DoubanAccessibilityService extends AccessibilityService {
             String title = parts.length >= 5 ? parts[4] : info.title;
 
             if (info.year != null && year != null &&
-                    Math.abs(info.year - year) > 2) {
+                    Math.abs(info.year - year) > 1) {
                 return null;
             }
 
@@ -704,7 +810,7 @@ public class DoubanAccessibilityService extends AccessibilityService {
     ) {
         cachePrefs().edit()
                 .putString(
-                        "tmdb4:" + info.cacheKey(),
+                        "tmdb5:" + info.cacheKey(),
                         result.tmdbId + "|" +
                                 result.type + "|" +
                                 (result.year == null ? "" : result.year) + "|" +
@@ -722,6 +828,16 @@ public class DoubanAccessibilityService extends AccessibilityService {
         return getSharedPreferences(
                 "douban_player_bridge_cache",
                 Context.MODE_PRIVATE);
+    }
+
+    private String compactError(Throwable error) {
+        if (error == null) return "未知错误";
+        String msg = error.getMessage();
+        if (TextUtils.isEmpty(msg)) {
+            msg = error.getClass().getSimpleName();
+        }
+        if (msg.length() > 140) msg = msg.substring(0, 140);
+        return msg;
     }
 
     private void collect(
@@ -809,6 +925,7 @@ public class DoubanAccessibilityService extends AccessibilityService {
         if (TextUtils.isEmpty(raw)) return null;
         Matcher m = YEAR.matcher(raw);
         if (!m.find()) return null;
+
         try {
             int year = Integer.parseInt(m.group(1));
             return year >= 1800 && year <= 2100 ? year : null;
@@ -819,6 +936,7 @@ public class DoubanAccessibilityService extends AccessibilityService {
 
     private void scheduleGracefulHide() {
         main.removeCallbacks(hideRunnable);
+
         long elapsed = android.os.SystemClock.uptimeMillis() - lastDoubanEventAt;
         long delay = elapsed < 1200L ? HIDE_GRACE_MS : 1400L;
         main.postDelayed(hideRunnable, delay);
@@ -838,10 +956,13 @@ public class DoubanAccessibilityService extends AccessibilityService {
         overlayStatus = null;
         stremioButton = null;
         nuvioButton = null;
+        infoButton = null;
         currentInfo = null;
         currentResolved = null;
         currentResolveKey = null;
+        resolveDiagnostic = "尚未开始匹配";
         resolving = false;
+        imdbLoading = false;
     }
 
     private int dp(int value) {
