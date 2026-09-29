@@ -14,6 +14,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.text.Normalizer;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.regex.Matcher;
@@ -21,7 +22,8 @@ import java.util.regex.Pattern;
 
 final class TmdbResolver {
     private static final String BASE = "https://api.themoviedb.org/3";
-    private static final Pattern YEAR = Pattern.compile("\\b(18|19|20)\\d{2}\\b");
+    private static final Pattern YEAR =
+            Pattern.compile("\\b(18|19|20)\\d{2}\\b");
 
     static final class Result {
         final long tmdbId;
@@ -37,6 +39,20 @@ final class TmdbResolver {
             this.year = year;
             this.imdbId = imdbId;
         }
+
+        Result withImdb(String value) {
+            return new Result(tmdbId, type, title, year, value);
+        }
+    }
+
+    static final class Lookup {
+        final Result result;
+        final String message;
+
+        Lookup(Result result, String message) {
+            this.result = result;
+            this.message = message;
+        }
     }
 
     private static final class Candidate {
@@ -45,165 +61,237 @@ final class TmdbResolver {
         String title;
         String originalTitle;
         Integer year;
-        int popularityRank;
+        int rank;
         int score;
     }
 
     private TmdbResolver() {}
 
-    static Result resolve(MediaInfo info, String credential) throws Exception {
-        if (info == null || TextUtils.isEmpty(info.title) || TextUtils.isEmpty(credential)) {
-            return null;
+    static boolean testCredential(String credential) throws Exception {
+        if (TextUtils.isEmpty(credential)) return false;
+        JSONObject root = getJson(BASE + "/configuration", credential);
+        return root.has("images");
+    }
+
+    /**
+     * Fast path: only resolve a TMDB meta id. No external-id request here.
+     * Usually 1 request; at most 2 if the primary title yields no strict match.
+     */
+    static Lookup resolveFast(MediaInfo info, String credential) throws Exception {
+        if (info == null || TextUtils.isEmpty(info.title)) {
+            return new Lookup(null, "没有可用标题");
+        }
+        if (TextUtils.isEmpty(credential)) {
+            return new Lookup(null, "TMDB Key 未设置");
         }
 
-        List<Candidate> candidates = new ArrayList<>();
-        if ("series".equals(info.preferredType)) {
-            candidates.addAll(search("tv", info, credential));
-            candidates.addAll(search("movie", info, credential));
-        } else {
-            candidates.addAll(search("movie", info, credential));
-            candidates.addAll(search("tv", info, credential));
+        LinkedHashSet<String> queries = new LinkedHashSet<>();
+        addQuery(queries, info.title);
+        for (String alias : info.aliases) {
+            if (queries.size() >= 3) break;
+            addQuery(queries, alias);
         }
 
         Candidate best = null;
-        for (Candidate c : candidates) {
-            c.score = score(c, info);
-            if (best == null || c.score > best.score) best = c;
+        String bestQuery = null;
+        int requestCount = 0;
+
+        for (String query : queries) {
+            if (requestCount >= 2) break;
+            requestCount++;
+
+            List<Candidate> candidates = searchMulti(query, credential);
+            for (Candidate c : candidates) {
+                c.score = score(c, info, query);
+                if (best == null || c.score > best.score) {
+                    best = c;
+                    bestQuery = query;
+                }
+            }
+
+            if (best != null && best.score >= 210) break;
         }
 
-        // Fail closed. A wrong media page is much worse than no shortcut.
-        if (best == null || best.score < 115) return null;
+        if (best == null || best.score < 150) {
+            return new Lookup(
+                    null,
+                    "TMDB 无可靠匹配" +
+                            (best == null ? "" :
+                                    "（最高分 " + best.score + "）")
+            );
+        }
 
-        String imdb = fetchImdbId(best, credential);
         String type = "tv".equals(best.type) ? "series" : "movie";
-        return new Result(best.id, type, best.title, best.year, imdb);
+        Result result = new Result(
+                best.id,
+                type,
+                best.title,
+                best.year,
+                null
+        );
+
+        return new Lookup(
+                result,
+                "TMDB " + best.id +
+                        " · " + best.title +
+                        (best.year == null ? "" : " (" + best.year + ")") +
+                        " · query=" + bestQuery +
+                        " · score=" + best.score
+        );
     }
 
-    private static List<Candidate> search(String type, MediaInfo info, String credential)
-            throws Exception {
-        String query = URLEncoder.encode(info.title, "UTF-8").replace("+", "%20");
-        StringBuilder endpoint = new StringBuilder(BASE)
-                .append("/search/").append(type)
-                .append("?query=").append(query)
-                .append("&include_adult=false")
-                .append("&language=zh-CN")
-                .append("&page=1");
+    static String fetchImdbId(Result result, String credential) throws Exception {
+        if (result == null || TextUtils.isEmpty(credential)) return null;
 
-        if (info.year != null) {
-            if ("movie".equals(type)) {
-                endpoint.append("&year=").append(info.year);
-            } else {
-                endpoint.append("&first_air_date_year=").append(info.year);
-            }
-        }
+        String endpoint = "series".equals(result.type)
+                ? BASE + "/tv/" + result.tmdbId + "/external_ids"
+                : BASE + "/movie/" + result.tmdbId + "/external_ids";
 
-        JSONObject root = getJson(endpoint.toString(), credential);
-        JSONArray results = root.optJSONArray("results");
-        List<Candidate> out = new ArrayList<>();
-        if (results == null) return out;
-
-        for (int i = 0; i < Math.min(12, results.length()); i++) {
-            JSONObject o = results.optJSONObject(i);
-            if (o == null) continue;
-
-            long id = o.optLong("id", 0);
-            if (id <= 0) continue;
-
-            Candidate c = new Candidate();
-            c.id = id;
-            c.type = type;
-            c.title = o.optString("title", o.optString("name", ""));
-            c.originalTitle = o.optString(
-                    "original_title",
-                    o.optString("original_name", "")
-            );
-            c.year = parseYear(o.optString(
-                    "release_date",
-                    o.optString("first_air_date", "")
-            ));
-            c.popularityRank = i;
-            out.add(c);
-        }
-        return out;
-    }
-
-    private static int score(Candidate c, MediaInfo info) {
-        int score = 0;
-
-        // Year is a hard gate when Douban exposes it.
-        if (info.year != null) {
-            if (c.year == null) {
-                score -= 50;
-            } else {
-                int delta = Math.abs(info.year - c.year);
-                if (delta == 0) score += 80;
-                else if (delta == 1) score += 35;
-                else if (delta <= 2) score += 10;
-                else return Integer.MIN_VALUE / 4;
-            }
-        }
-
-        String candidate = normalize(c.title);
-        String original = normalize(c.originalTitle);
-
-        int bestTitle = titleScore(normalize(info.title), candidate, original);
-        for (String alias : info.aliases) {
-            bestTitle = Math.max(
-                    bestTitle,
-                    titleScore(normalize(alias), candidate, original)
-            );
-        }
-        score += bestTitle;
-
-        String expected = "series".equals(info.preferredType) ? "tv" : "movie";
-        if (expected.equals(c.type)) score += 20;
-
-        score += Math.max(0, 10 - c.popularityRank);
-        return score;
-    }
-
-    private static int titleScore(String q, String title, String original) {
-        if (TextUtils.isEmpty(q)) return 0;
-        if (q.equals(title) || q.equals(original)) return 100;
-
-        if (!TextUtils.isEmpty(title) &&
-                (q.contains(title) || title.contains(q))) {
-            return 55;
-        }
-        if (!TextUtils.isEmpty(original) &&
-                (q.contains(original) || original.contains(q))) {
-            return 55;
-        }
-        return 0;
-    }
-
-    private static String fetchImdbId(Candidate c, String credential)
-            throws Exception {
-        String endpoint;
-        if ("tv".equals(c.type)) {
-            endpoint = BASE + "/tv/" + c.id + "/external_ids";
-        } else {
-            endpoint = BASE + "/movie/" + c.id + "/external_ids";
-        }
         JSONObject root = getJson(endpoint, credential);
         String imdb = root.optString("imdb_id", "");
         return imdb.matches("tt\\d{5,12}") ? imdb : null;
     }
 
-    private static JSONObject getJson(String url, String credential) throws Exception {
-        boolean bearer = credential.startsWith("eyJ") || credential.length() > 64;
+    private static void addQuery(LinkedHashSet<String> queries, String value) {
+        if (TextUtils.isEmpty(value)) return;
+        String q = value.trim();
+        if (q.isEmpty()) return;
+
+        // Strip a trailing year in case Douban exposes "The Odyssey (2026)"
+        // as a single accessibility string.
+        q = q.replaceAll(
+                "\\s*[（(](?:18|19|20)\\d{2}[）)]\\s*$",
+                ""
+        ).trim();
+
+        if (!q.isEmpty()) queries.add(q);
+    }
+
+    private static List<Candidate> searchMulti(
+            String query,
+            String credential
+    ) throws Exception {
+        String encoded = URLEncoder.encode(query, "UTF-8")
+                .replace("+", "%20");
+
+        String endpoint = BASE +
+                "/search/multi?query=" + encoded +
+                "&include_adult=false&language=zh-CN&page=1";
+
+        JSONObject root = getJson(endpoint, credential);
+        JSONArray results = root.optJSONArray("results");
+        List<Candidate> out = new ArrayList<>();
+        if (results == null) return out;
+
+        int rank = 0;
+        for (int i = 0; i < Math.min(20, results.length()); i++) {
+            JSONObject o = results.optJSONObject(i);
+            if (o == null) continue;
+
+            String mediaType = o.optString("media_type", "");
+            if (!"movie".equals(mediaType) && !"tv".equals(mediaType)) {
+                continue;
+            }
+
+            long id = o.optLong("id", 0L);
+            if (id <= 0L) continue;
+
+            Candidate c = new Candidate();
+            c.id = id;
+            c.type = mediaType;
+            c.title = "movie".equals(mediaType)
+                    ? o.optString("title", "")
+                    : o.optString("name", "");
+            c.originalTitle = "movie".equals(mediaType)
+                    ? o.optString("original_title", "")
+                    : o.optString("original_name", "");
+            c.year = parseYear(
+                    "movie".equals(mediaType)
+                            ? o.optString("release_date", "")
+                            : o.optString("first_air_date", "")
+            );
+            c.rank = rank++;
+            out.add(c);
+        }
+        return out;
+    }
+
+    private static int score(Candidate c, MediaInfo info, String query) {
+        int score = 0;
+
+        if (info.year != null) {
+            if (c.year == null) {
+                score -= 25;
+            } else {
+                int delta = Math.abs(info.year - c.year);
+                if (delta == 0) score += 95;
+                else if (delta == 1) score += 35;
+                else return Integer.MIN_VALUE / 4;
+            }
+        }
+
+        int titleScore = 0;
+        titleScore = Math.max(
+                titleScore,
+                compareTitle(query, c.title, c.originalTitle)
+        );
+        titleScore = Math.max(
+                titleScore,
+                compareTitle(info.title, c.title, c.originalTitle)
+        );
+        for (String alias : info.aliases) {
+            titleScore = Math.max(
+                    titleScore,
+                    compareTitle(alias, c.title, c.originalTitle)
+            );
+        }
+        score += titleScore;
+
+        String expectedType = "series".equals(info.preferredType)
+                ? "tv" : "movie";
+        if (expectedType.equals(c.type)) score += 22;
+
+        score += Math.max(0, 12 - c.rank);
+        return score;
+    }
+
+    private static int compareTitle(
+            String source,
+            String localized,
+            String original
+    ) {
+        String q = normalize(source);
+        String a = normalize(localized);
+        String b = normalize(original);
+
+        if (q.isEmpty()) return 0;
+        if (q.equals(a) || q.equals(b)) return 120;
+
+        // Only allow containment for reasonably long strings.
+        if (q.length() >= 4) {
+            if (!a.isEmpty() && (q.contains(a) || a.contains(q))) return 65;
+            if (!b.isEmpty() && (q.contains(b) || b.contains(q))) return 65;
+        }
+        return 0;
+    }
+
+    private static JSONObject getJson(String url, String credential)
+            throws Exception {
+        String token = credential == null ? "" : credential.trim();
+        boolean bearer = token.startsWith("eyJ") || token.length() > 64;
+
         if (!bearer) {
             url += (url.contains("?") ? "&" : "?") +
-                    "api_key=" + URLEncoder.encode(credential, "UTF-8");
+                    "api_key=" + URLEncoder.encode(token, "UTF-8");
         }
 
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-        c.setConnectTimeout(4500);
-        c.setReadTimeout(6000);
+        c.setConnectTimeout(4000);
+        c.setReadTimeout(5000);
         c.setRequestProperty("Accept", "application/json");
-        c.setRequestProperty("User-Agent", "DoubanPlayerBridge/0.2");
+        c.setRequestProperty("User-Agent", "DoubanPlayerBridge/0.2.1");
         if (bearer) {
-            c.setRequestProperty("Authorization", "Bearer " + credential);
+            c.setRequestProperty("Authorization", "Bearer " + token);
         }
 
         int code = c.getResponseCode();
@@ -213,8 +301,12 @@ final class TmdbResolver {
         c.disconnect();
 
         if (code < 200 || code >= 300) {
-            throw new IllegalStateException("TMDB HTTP " + code);
+            throw new IllegalStateException(
+                    "TMDB HTTP " + code +
+                            (TextUtils.isEmpty(body) ? "" : " " + body)
+            );
         }
+
         return new JSONObject(body);
     }
 
