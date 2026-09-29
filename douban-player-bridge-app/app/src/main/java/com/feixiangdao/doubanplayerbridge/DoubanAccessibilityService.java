@@ -43,10 +43,16 @@ public class DoubanAccessibilityService extends AccessibilityService {
     private static final String DOUBAN_PACKAGE = "com.douban.frodo";
     private static final String SELF_PACKAGE =
             "com.feixiangdao.doubanplayerbridge";
-    private static final long HIDE_GRACE_MS = 2200L;
+    private static final String NUVIO_PACKAGE = "com.nuvio.app";
+    private static final String NUVIO_ACTIVITY = "com.nuvio.app.MainActivity";
+    private static final String STREMIO_PACKAGE = "com.stremio.one";
+
+    private static final long HIDE_GRACE_MS = 2600L;
 
     private static final Pattern YEAR =
             Pattern.compile("(?:\\(|（)?\\b((?:18|19|20)\\d{2})\\b(?:\\)|）)?");
+    private static final Pattern EXACT_YEAR =
+            Pattern.compile("^[（(]?((?:18|19|20)\\d{2})[）)]?$");
 
     private static final Set<String> EXACT_REJECT = new HashSet<>();
     static {
@@ -64,14 +70,20 @@ public class DoubanAccessibilityService extends AccessibilityService {
 
     private WindowManager windowManager;
     private View overlay;
+    private TextView overlayStatus;
     private TextView stremioButton;
     private TextView nuvioButton;
+
     private MediaInfo currentInfo;
+    private TmdbResolver.Result currentResolved;
+    private String currentResolveKey;
+    private boolean resolving;
+
     private String lastDoubanWindowClass;
+    private long lastDoubanEventAt;
 
     private final Runnable scanRunnable = this::scanCurrentWindow;
     private final Runnable hideRunnable = this::hideOverlay;
-    private long lastDoubanEventAt = 0L;
 
     @Override
     protected void onServiceConnected() {
@@ -87,11 +99,7 @@ public class DoubanAccessibilityService extends AccessibilityService {
         CharSequence pkgCs = event.getPackageName();
         String pkg = pkgCs == null ? "" : pkgCs.toString();
 
-        // AccessibilityOverlay interactions can generate events belonging to
-        // this helper app. Never treat those as "left Douban".
-        if (SELF_PACKAGE.equals(pkg)) {
-            return;
-        }
+        if (SELF_PACKAGE.equals(pkg)) return;
 
         if (DOUBAN_PACKAGE.equals(pkg)) {
             lastDoubanEventAt = android.os.SystemClock.uptimeMillis();
@@ -100,18 +108,14 @@ public class DoubanAccessibilityService extends AccessibilityService {
             if (event.getEventType() ==
                     AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
                 CharSequence cls = event.getClassName();
-                if (cls != null) {
-                    lastDoubanWindowClass = cls.toString();
-                }
+                if (cls != null) lastDoubanWindowClass = cls.toString();
             }
 
             main.removeCallbacks(scanRunnable);
-            main.postDelayed(scanRunnable, 300);
+            main.postDelayed(scanRunnable, 350);
             return;
         }
 
-        // Ignore transient content events from keyboards/system overlays.
-        // Only a real window switch away from Douban starts a delayed hide.
         if (event.getEventType() ==
                 AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             main.removeCallbacks(hideRunnable);
@@ -143,21 +147,13 @@ public class DoubanAccessibilityService extends AccessibilityService {
         collect(root, entries, counter, 0);
 
         if (!isMovieDetail(entries)) {
-            // Douban frequently rebuilds portions of the accessibility tree
-            // while scrolling/loading. Keep a currently visible overlay alive
-            // during these short gaps instead of flickering.
-            if (overlay != null) {
-                scheduleGracefulHide();
-            } else {
-                hideOverlay();
-            }
+            if (overlay != null) scheduleGracefulHide();
+            else hideOverlay();
             return;
         }
 
         MediaInfo info = extractMediaInfo(entries);
         if (info == null || TextUtils.isEmpty(info.title)) {
-            // Preserve the last good media identity during a transient tree
-            // refresh. A later valid scan will replace it.
             if (overlay != null && currentInfo != null) {
                 main.removeCallbacks(hideRunnable);
             } else {
@@ -167,8 +163,21 @@ public class DoubanAccessibilityService extends AccessibilityService {
         }
 
         main.removeCallbacks(hideRunnable);
+
+        String oldKey = currentInfo == null ? null : currentInfo.cacheKey();
+        String newKey = info.cacheKey();
         currentInfo = info;
+
         showOrUpdateOverlay(info);
+
+        if (!newKey.equals(oldKey)) {
+            currentResolved = null;
+            currentResolveKey = null;
+            resolving = false;
+            beginPreResolve(info);
+        } else {
+            updateOverlayState();
+        }
     }
 
     private boolean isMovieDetail(List<NodeText> entries) {
@@ -180,7 +189,6 @@ public class DoubanAccessibilityService extends AccessibilityService {
             String t = entry.text;
             if ("想看".equals(t)) want = true;
             if ("看过".equals(t)) seen = true;
-
             if ("短评".equals(t) || "影评".equals(t) || "演职员".equals(t) ||
                     "预告片".equals(t) || "剧照".equals(t) || "简介".equals(t)) {
                 markers++;
@@ -189,7 +197,7 @@ public class DoubanAccessibilityService extends AccessibilityService {
 
         boolean classMatch = lastDoubanWindowClass != null &&
                 (lastDoubanWindowClass.contains("MovieActivity2") ||
-                 lastDoubanWindowClass.contains(".subject."));
+                        lastDoubanWindowClass.contains(".subject."));
 
         return (want && seen && markers >= 1) || classMatch;
     }
@@ -197,120 +205,130 @@ public class DoubanAccessibilityService extends AccessibilityService {
     private MediaInfo extractMediaInfo(List<NodeText> entries) {
         DisplayMetrics dm = getResources().getDisplayMetrics();
         int screenHeight = dm.heightPixels;
+        int maxTitleArea = (int) (screenHeight * 0.52f);
 
-        List<NodeText> yearAnchors = new ArrayList<>();
-        for (NodeText entry : entries) {
-            if (entry.bounds.centerY() <= 0 ||
-                    entry.bounds.centerY() > screenHeight * 0.60) {
-                continue;
-            }
-            if (parseYear(entry.text) != null) {
-                yearAnchors.add(entry);
-            }
-        }
-
-        NodeText best = null;
-        int bestScore = Integer.MIN_VALUE;
-
-        for (NodeText entry : entries) {
-            String cleaned = cleanTitle(entry.text);
-            if (!looksLikeTitle(cleaned)) continue;
-
-            int score = 0;
-            String id = entry.viewId == null ? "" :
-                    entry.viewId.toLowerCase(Locale.US);
-
-            if (id.contains("title")) score += 180;
-            if (id.contains("subject")) score += 60;
-            if (id.contains("name")) score += 35;
-
-            int y = entry.bounds.centerY();
-            int h = entry.bounds.height();
-            int w = entry.bounds.width();
-
-            if (y > 0 && y < screenHeight * 0.50) score += 45;
-            if (y > 0 && y < screenHeight * 0.32) score += 25;
-
-            // The real Douban title is typically immediately above/next to
-            // the "(YYYY)" node. Give that spatial relationship the strongest
-            // weight so generic strings such as "电影" cannot win.
-            int nearestYearDistance = Integer.MAX_VALUE;
-            for (NodeText anchor : yearAnchors) {
-                nearestYearDistance = Math.min(
-                        nearestYearDistance,
-                        Math.abs(anchor.bounds.centerY() - y)
-                );
-            }
-            if (nearestYearDistance != Integer.MAX_VALUE) {
-                if (nearestYearDistance <= screenHeight * 0.055) score += 150;
-                else if (nearestYearDistance <= screenHeight * 0.10) score += 90;
-                else if (nearestYearDistance <= screenHeight * 0.16) score += 35;
-                else score -= 30;
-            }
-
-            score += Math.min(65, Math.max(0, h));
-            score += Math.min(45, Math.max(0, w / 6));
-
-            int len = cleaned.length();
-            if (len >= 2 && len <= 40) score += 25;
-            if (len > 70) score -= 60;
-
-            if (entry.text.contains("评分") || entry.text.contains("人评价") ||
-                    entry.text.contains("条短评")) {
-                score -= 150;
-            }
-
-            if (score > bestScore) {
-                bestScore = score;
-                best = entry;
-            }
-        }
-
-        if (best == null) return null;
-
-        MediaInfo info = new MediaInfo();
-        info.title = cleanTitle(best.text);
-        info.year = parseYear(best.text);
-
-        // Add nearby upper-page strings as alternate search titles. Douban
-        // often exposes the original/foreign title as a second TextView.
-        List<NodeText> nearby = new ArrayList<>();
+        List<NodeText> exactYearAnchors = new ArrayList<>();
         for (NodeText entry : entries) {
             int y = entry.bounds.centerY();
-            if (y <= 0 || y > screenHeight * 0.55) continue;
-            String s = cleanTitle(entry.text);
-            if (!looksLikeTitle(s)) continue;
-            if (s.equals(info.title)) continue;
-            nearby.add(entry);
-
-            if (info.year == null) {
-                Integer yv = parseYear(entry.text);
-                if (yv != null) info.year = yv;
+            if (y <= 0 || y > maxTitleArea) continue;
+            if (EXACT_YEAR.matcher(entry.text.trim()).matches()) {
+                exactYearAnchors.add(entry);
             }
         }
+        exactYearAnchors.sort(
+                Comparator.comparingInt(a -> a.bounds.centerY()));
 
-        final NodeText bestNode = best;
-        nearby.sort(Comparator.comparingInt(a ->
-                Math.abs(a.bounds.centerY() - bestNode.bounds.centerY())));
+        NodeText bestTitle = null;
+        NodeText bestYearAnchor = null;
+        int bestPairScore = Integer.MIN_VALUE;
 
-        for (NodeText e : nearby) {
-            String alias = cleanTitle(e.text);
-            if (!info.aliases.contains(alias)) {
-                info.aliases.add(alias);
-            }
-            if (info.aliases.size() >= 4) break;
-        }
+        // First choice: a real title visually paired with a standalone (YYYY).
+        for (NodeText anchor : exactYearAnchors) {
+            for (NodeText candidate : entries) {
+                if (candidate == anchor) continue;
+                String title = cleanTitle(candidate.text);
+                if (!looksLikeTitle(title)) continue;
 
-        // If year is still unknown, look through the upper half first, then all.
-        if (info.year == null) {
-            for (NodeText entry : entries) {
-                if (entry.bounds.centerY() > screenHeight * 0.65) continue;
-                Integer y = parseYear(entry.text);
-                if (y != null) {
-                    info.year = y;
-                    break;
+                int candidateY = candidate.bounds.centerY();
+                if (candidateY <= 0 || candidateY >= anchor.bounds.centerY()) {
+                    continue;
+                }
+
+                int gap = anchor.bounds.top - candidate.bounds.bottom;
+                if (gap < -dp(18) || gap > dp(170)) continue;
+
+                int horizontalDistance = Math.abs(
+                        candidate.bounds.left - anchor.bounds.left);
+                if (horizontalDistance > dm.widthPixels * 0.52f) continue;
+
+                int score = 300;
+                score -= Math.max(0, gap);
+                score -= horizontalDistance / 5;
+                score += Math.min(100, candidate.bounds.height() * 2);
+                score += Math.min(60, candidate.bounds.width() / 5);
+
+                String id = candidate.viewId == null ? "" :
+                        candidate.viewId.toLowerCase(Locale.US);
+                if (id.contains("title")) score += 100;
+                if (id.contains("subject")) score += 30;
+
+                if (score > bestPairScore) {
+                    bestPairScore = score;
+                    bestTitle = candidate;
+                    bestYearAnchor = anchor;
                 }
             }
+
+            // The first standalone year near the top is normally the title year.
+            if (bestTitle != null) break;
+        }
+
+        // Fallback only when the title/year pair is not exposed as separate
+        // accessibility nodes. Prefer explicit title resource IDs.
+        if (bestTitle == null) {
+            int bestScore = Integer.MIN_VALUE;
+            for (NodeText entry : entries) {
+                int y = entry.bounds.centerY();
+                if (y <= 0 || y > maxTitleArea) continue;
+
+                String title = cleanTitle(entry.text);
+                if (!looksLikeTitle(title)) continue;
+
+                String id = entry.viewId == null ? "" :
+                        entry.viewId.toLowerCase(Locale.US);
+
+                int score = 0;
+                if (id.contains("title")) score += 220;
+                if (id.contains("subject")) score += 60;
+                if (id.contains("name")) score += 30;
+                score += Math.min(90, entry.bounds.height() * 2);
+                score += Math.min(50, entry.bounds.width() / 6);
+                if (y < screenHeight * 0.35f) score += 40;
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestTitle = entry;
+                }
+            }
+        }
+
+        if (bestTitle == null) return null;
+
+        MediaInfo info = new MediaInfo();
+        info.title = cleanTitle(bestTitle.text);
+
+        if (bestYearAnchor != null) {
+            info.year = parseYear(bestYearAnchor.text);
+        } else {
+            info.year = parseYear(bestTitle.text);
+            if (info.year == null && !exactYearAnchors.isEmpty()) {
+                info.year = parseYear(exactYearAnchors.get(0).text);
+            }
+        }
+
+        // Nearby text may contain an English/original title. Keep only a few
+        // spatially close aliases for TMDB exact-name comparison.
+        List<NodeText> aliases = new ArrayList<>();
+        final NodeText titleNode = bestTitle;
+        for (NodeText entry : entries) {
+            if (entry == bestTitle || entry == bestYearAnchor) continue;
+            int y = entry.bounds.centerY();
+            if (y <= 0 || y > screenHeight * 0.56f) continue;
+            if (Math.abs(y - bestTitle.bounds.centerY()) > dp(150)) continue;
+
+            String value = cleanTitle(entry.text);
+            if (!looksLikeTitle(value) || value.equals(info.title)) continue;
+            if (EXACT_YEAR.matcher(entry.text.trim()).matches()) continue;
+            aliases.add(entry);
+        }
+
+        aliases.sort(Comparator.comparingInt(a ->
+                Math.abs(a.bounds.centerY() - titleNode.bounds.centerY())));
+
+        for (NodeText alias : aliases) {
+            String value = cleanTitle(alias.text);
+            if (!info.aliases.contains(value)) info.aliases.add(value);
+            if (info.aliases.size() >= 3) break;
         }
 
         boolean series = false;
@@ -325,6 +343,385 @@ public class DoubanAccessibilityService extends AccessibilityService {
         }
         info.preferredType = series ? "series" : "movie";
         return info;
+    }
+
+    private void beginPreResolve(MediaInfo info) {
+        String credential = getSharedPreferences(
+                MainActivity.SETTINGS_PREFS, MODE_PRIVATE)
+                .getString(MainActivity.TMDB_CREDENTIAL_KEY, "")
+                .trim();
+
+        currentResolveKey = info.cacheKey();
+
+        if (TextUtils.isEmpty(credential)) {
+            resolving = false;
+            currentResolved = null;
+            updateOverlayState();
+            return;
+        }
+
+        TmdbResolver.Result cached = readTmdbCache(info);
+        if (cached != null) {
+            resolving = false;
+            currentResolved = cached;
+            updateOverlayState();
+            return;
+        }
+
+        resolving = true;
+        currentResolved = null;
+        updateOverlayState();
+
+        final String expectedKey = currentResolveKey;
+        worker.execute(() -> {
+            TmdbResolver.Result result = null;
+            Throwable failure = null;
+            try {
+                result = TmdbResolver.resolve(info, credential);
+            } catch (Throwable error) {
+                failure = error;
+                Log.w(TAG, "TMDB resolve failed", error);
+            }
+
+            TmdbResolver.Result finalResult = result;
+            Throwable finalFailure = failure;
+            main.post(() -> {
+                if (currentInfo == null ||
+                        !expectedKey.equals(currentInfo.cacheKey())) {
+                    return;
+                }
+
+                resolving = false;
+                currentResolved = finalResult;
+
+                if (finalResult != null) {
+                    writeTmdbCache(info, finalResult);
+                } else if (finalFailure != null) {
+                    Log.w(TAG, "TMDB lookup produced no result", finalFailure);
+                }
+                updateOverlayState();
+            });
+        });
+    }
+
+    private void updateOverlayState() {
+        if (overlayStatus == null || currentInfo == null) return;
+
+        String media = currentInfo.title +
+                (currentInfo.year == null ? "" : " (" + currentInfo.year + ")");
+
+        String credential = getSharedPreferences(
+                MainActivity.SETTINGS_PREFS, MODE_PRIVATE)
+                .getString(MainActivity.TMDB_CREDENTIAL_KEY, "")
+                .trim();
+
+        if (TextUtils.isEmpty(credential)) {
+            overlayStatus.setText(media + " · 请先设置 TMDB Key");
+            setButtonEnabled(stremioButton, true);
+            setButtonEnabled(nuvioButton, false);
+            return;
+        }
+
+        if (resolving) {
+            overlayStatus.setText(media + " · TMDB 匹配中…");
+            setButtonEnabled(stremioButton, false);
+            setButtonEnabled(nuvioButton, false);
+            return;
+        }
+
+        if (currentResolved == null) {
+            overlayStatus.setText(media + " · 未找到可靠匹配");
+            setButtonEnabled(stremioButton, true);
+            setButtonEnabled(nuvioButton, false);
+            return;
+        }
+
+        String resolvedTitle = TextUtils.isEmpty(currentResolved.title)
+                ? media : currentResolved.title;
+        overlayStatus.setText(
+                media + " → " + resolvedTitle +
+                        " · TMDB " + currentResolved.tmdbId
+        );
+
+        setButtonEnabled(stremioButton, true);
+        setButtonEnabled(nuvioButton, true);
+    }
+
+    private void setButtonEnabled(TextView button, boolean enabled) {
+        if (button == null) return;
+        button.setEnabled(enabled);
+        button.setAlpha(enabled ? 1.0f : 0.42f);
+    }
+
+    private void onStremioClick() {
+        MediaInfo info = currentInfo;
+        if (info == null) return;
+
+        if (currentResolved != null &&
+                !TextUtils.isEmpty(currentResolved.imdbId)) {
+            String uri = "series".equals(currentResolved.type)
+                    ? "stremio:///detail/series/" + currentResolved.imdbId
+                    : "stremio:///detail/movie/" + currentResolved.imdbId +
+                        "/" + currentResolved.imdbId;
+            launchStremio(uri);
+            return;
+        }
+
+        openStremioSearch(info);
+    }
+
+    private void onNuvioClick() {
+        if (currentResolved == null) {
+            Toast.makeText(
+                    this,
+                    resolving ? "TMDB 仍在匹配，请稍候" : "没有可靠 TMDB 匹配",
+                    Toast.LENGTH_SHORT
+            ).show();
+            return;
+        }
+
+        launchNuvio(currentResolved.type, currentResolved.tmdbId);
+    }
+
+    private void launchNuvio(String type, long tmdbId) {
+        Uri uri = new Uri.Builder()
+                .scheme("nuvio")
+                .authority("meta")
+                .appendQueryParameter("type", type)
+                .appendQueryParameter("id", "tmdb:" + tmdbId)
+                .build();
+
+        Intent intent = new Intent(Intent.ACTION_VIEW, uri);
+        intent.setClassName(NUVIO_PACKAGE, NUVIO_ACTIVITY);
+        intent.addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK |
+                Intent.FLAG_ACTIVITY_CLEAR_TASK
+        );
+
+        try {
+            startActivity(intent);
+        } catch (Throwable error) {
+            try {
+                Intent fallback = new Intent(Intent.ACTION_VIEW, uri);
+                fallback.setPackage(NUVIO_PACKAGE);
+                fallback.addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK |
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP |
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP
+                );
+                startActivity(fallback);
+            } catch (Throwable second) {
+                Toast.makeText(
+                        this,
+                        "无法打开 Nuvio：" + second.getClass().getSimpleName(),
+                        Toast.LENGTH_LONG
+                ).show();
+            }
+        }
+    }
+
+    private void launchStremio(String uri) {
+        try {
+            Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(uri));
+            intent.setPackage(STREMIO_PACKAGE);
+            intent.addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK |
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP |
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP
+            );
+            startActivity(intent);
+        } catch (Throwable error) {
+            Toast.makeText(this, "没有检测到 Stremio", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void openStremioSearch(MediaInfo info) {
+        try {
+            String query = info.title +
+                    (info.year == null ? "" : " " + info.year);
+            String encoded = URLEncoder.encode(query, "UTF-8")
+                    .replace("+", "%20");
+            launchStremio("stremio:///search?search=" + encoded);
+        } catch (Exception e) {
+            Toast.makeText(
+                    this,
+                    "无法生成 Stremio 搜索链接",
+                    Toast.LENGTH_LONG
+            ).show();
+        }
+    }
+
+    private void showOrUpdateOverlay(MediaInfo info) {
+        if (windowManager == null) return;
+
+        if (overlay == null) {
+            overlay = buildOverlay();
+            WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                    WindowManager.LayoutParams.WRAP_CONTENT,
+                    WindowManager.LayoutParams.WRAP_CONTENT,
+                    WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
+                            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL |
+                            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                    PixelFormat.TRANSLUCENT
+            );
+            lp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+            lp.y = dp(82);
+
+            try {
+                windowManager.addView(overlay, lp);
+            } catch (Throwable error) {
+                Log.w(TAG, "Failed to add accessibility overlay", error);
+                overlay = null;
+            }
+        }
+
+        updateOverlayState();
+    }
+
+    private View buildOverlay() {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setGravity(Gravity.CENTER);
+        card.setPadding(dp(10), dp(8), dp(10), dp(8));
+
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0xF2FFFFFF);
+        bg.setCornerRadius(dp(24));
+        bg.setStroke(dp(1), 0x26000000);
+        card.setBackground(bg);
+        card.setElevation(dp(9));
+
+        overlayStatus = new TextView(this);
+        overlayStatus.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        overlayStatus.setTextColor(0xFF333333);
+        overlayStatus.setGravity(Gravity.CENTER);
+        overlayStatus.setMaxLines(2);
+        overlayStatus.setPadding(dp(6), 0, dp(6), dp(6));
+        card.addView(
+                overlayStatus,
+                new LinearLayout.LayoutParams(
+                        dp(250),
+                        LinearLayout.LayoutParams.WRAP_CONTENT)
+        );
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER);
+
+        stremioButton = makeButton("Stremio", 0xFF7B5EA7);
+        nuvioButton = makeButton("Nuvio", 0xFF25282D);
+
+        LinearLayout.LayoutParams first = new LinearLayout.LayoutParams(
+                dp(112), dp(42));
+        first.rightMargin = dp(7);
+        row.addView(stremioButton, first);
+        row.addView(nuvioButton,
+                new LinearLayout.LayoutParams(dp(98), dp(42)));
+
+        card.addView(row);
+
+        stremioButton.setOnClickListener(v -> onStremioClick());
+        nuvioButton.setOnClickListener(v -> onNuvioClick());
+
+        View.OnLongClickListener debug = v -> {
+            StringBuilder message = new StringBuilder();
+            if (currentInfo != null) {
+                message.append(currentInfo.debugText());
+            } else {
+                message.append("尚未识别影片");
+            }
+
+            if (currentResolved != null) {
+                message.append("\nTMDB: ")
+                        .append(currentResolved.tmdbId)
+                        .append("\nTMDB标题: ")
+                        .append(currentResolved.title)
+                        .append("\nIMDb: ")
+                        .append(TextUtils.isEmpty(currentResolved.imdbId)
+                                ? "?" : currentResolved.imdbId);
+            }
+
+            Toast.makeText(
+                    this,
+                    message.toString(),
+                    Toast.LENGTH_LONG
+            ).show();
+            return true;
+        };
+        stremioButton.setOnLongClickListener(debug);
+        nuvioButton.setOnLongClickListener(debug);
+
+        return card;
+    }
+
+    private TextView makeButton(String label, int color) {
+        TextView v = new TextView(this);
+        v.setText(label);
+        v.setTextColor(Color.WHITE);
+        v.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        v.setGravity(Gravity.CENTER);
+        v.setTypeface(v.getTypeface(), android.graphics.Typeface.BOLD);
+
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(color);
+        bg.setCornerRadius(dp(21));
+        v.setBackground(bg);
+        return v;
+    }
+
+    private TmdbResolver.Result readTmdbCache(MediaInfo info) {
+        String raw = cachePrefs().getString("tmdb4:" + info.cacheKey(), null);
+        if (raw == null) return null;
+
+        String[] parts = raw.split("\\|", 5);
+        if (parts.length < 3) return null;
+
+        try {
+            long tmdbId = Long.parseLong(parts[0]);
+            String type = parts[1];
+            Integer year = TextUtils.isEmpty(parts[2])
+                    ? null : Integer.valueOf(parts[2]);
+            String imdb = parts.length >= 4 && !TextUtils.isEmpty(parts[3])
+                    ? parts[3] : null;
+            String title = parts.length >= 5 ? parts[4] : info.title;
+
+            if (info.year != null && year != null &&
+                    Math.abs(info.year - year) > 2) {
+                return null;
+            }
+
+            return new TmdbResolver.Result(
+                    tmdbId, type, title, year, imdb);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private void writeTmdbCache(
+            MediaInfo info,
+            TmdbResolver.Result result
+    ) {
+        cachePrefs().edit()
+                .putString(
+                        "tmdb4:" + info.cacheKey(),
+                        result.tmdbId + "|" +
+                                result.type + "|" +
+                                (result.year == null ? "" : result.year) + "|" +
+                                (result.imdbId == null ? "" : result.imdbId) + "|" +
+                                sanitizeCacheText(result.title)
+                )
+                .apply();
+    }
+
+    private String sanitizeCacheText(String value) {
+        return value == null ? "" : value.replace("|", " ");
+    }
+
+    private SharedPreferences cachePrefs() {
+        return getSharedPreferences(
+                "douban_player_bridge_cache",
+                Context.MODE_PRIVATE);
     }
 
     private void collect(
@@ -422,314 +819,29 @@ public class DoubanAccessibilityService extends AccessibilityService {
 
     private void scheduleGracefulHide() {
         main.removeCallbacks(hideRunnable);
-
         long elapsed = android.os.SystemClock.uptimeMillis() - lastDoubanEventAt;
-        long delay = elapsed < 1200L ? HIDE_GRACE_MS : 1200L;
+        long delay = elapsed < 1200L ? HIDE_GRACE_MS : 1400L;
         main.postDelayed(hideRunnable, delay);
-    }
-
-    private void showOrUpdateOverlay(MediaInfo info) {
-        if (windowManager == null) return;
-
-        if (overlay == null) {
-            overlay = buildOverlay();
-            WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                    WindowManager.LayoutParams.WRAP_CONTENT,
-                    WindowManager.LayoutParams.WRAP_CONTENT,
-                    WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
-                            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL |
-                            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                    PixelFormat.TRANSLUCENT
-            );
-            lp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
-            lp.y = dp(86);
-
-            try {
-                windowManager.addView(overlay, lp);
-            } catch (Throwable error) {
-                Log.w(TAG, "Failed to add accessibility overlay", error);
-                overlay = null;
-            }
-        }
-    }
-
-    private View buildOverlay() {
-        LinearLayout bar = new LinearLayout(this);
-        bar.setOrientation(LinearLayout.HORIZONTAL);
-        bar.setGravity(Gravity.CENTER);
-        bar.setPadding(dp(7), dp(6), dp(7), dp(6));
-
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(0xEFFFFFFF);
-        bg.setCornerRadius(dp(28));
-        bg.setStroke(dp(1), 0x22000000);
-        bar.setBackground(bg);
-        bar.setElevation(dp(9));
-
-        stremioButton = makeButton("Stremio", 0xFF7B5EA7);
-        nuvioButton = makeButton("Nuvio", 0xFF25282D);
-
-        LinearLayout.LayoutParams first = new LinearLayout.LayoutParams(
-                dp(104), dp(44));
-        first.rightMargin = dp(7);
-        bar.addView(stremioButton, first);
-        bar.addView(nuvioButton,
-                new LinearLayout.LayoutParams(dp(92), dp(44)));
-
-        stremioButton.setOnClickListener(v -> resolveAndOpen(false));
-        nuvioButton.setOnClickListener(v -> resolveAndOpen(true));
-
-        View.OnLongClickListener debug = v -> {
-            MediaInfo info = currentInfo;
-            Toast.makeText(
-                    this,
-                    info == null ? "尚未识别影片" : info.debugText(),
-                    Toast.LENGTH_LONG
-            ).show();
-            return true;
-        };
-        stremioButton.setOnLongClickListener(debug);
-        nuvioButton.setOnLongClickListener(debug);
-
-        return bar;
-    }
-
-    private TextView makeButton(String label, int color) {
-        TextView v = new TextView(this);
-        v.setText(label);
-        v.setTextColor(Color.WHITE);
-        v.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        v.setGravity(Gravity.CENTER);
-        v.setTypeface(v.getTypeface(), android.graphics.Typeface.BOLD);
-
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(color);
-        bg.setCornerRadius(dp(22));
-        v.setBackground(bg);
-        return v;
-    }
-
-    private void resolveAndOpen(boolean nuvio) {
-        MediaInfo info = currentInfo;
-        if (info == null || TextUtils.isEmpty(info.title)) {
-            Toast.makeText(this, "尚未识别当前影片", Toast.LENGTH_SHORT).show();
-            return;
-        }
-
-        CinemetaResolver.Result cached = readCache(info);
-        if (cached != null) {
-            openResolved(cached, nuvio, info);
-            return;
-        }
-
-        Toast.makeText(this, "正在匹配 IMDb…", Toast.LENGTH_SHORT).show();
-
-        worker.execute(() -> {
-            CinemetaResolver.Result result = null;
-            try {
-                result = CinemetaResolver.resolve(info);
-            } catch (Throwable error) {
-                Log.w(TAG, "Cinemeta resolve failed", error);
-            }
-
-            CinemetaResolver.Result finalResult = result;
-            main.post(() -> {
-                if (finalResult != null) {
-                    writeCache(info, finalResult);
-                    openResolved(finalResult, nuvio, info);
-                } else if (!nuvio) {
-                    openStremioSearch(info);
-                } else {
-                    Toast.makeText(
-                            this,
-                            "没有可靠匹配到 IMDb。长按按钮查看识别结果。",
-                            Toast.LENGTH_LONG
-                    ).show();
-                }
-            });
-        });
-    }
-
-    private void openResolved(
-            CinemetaResolver.Result result,
-            boolean nuvio,
-            MediaInfo info
-    ) {
-        String type = "series".equals(result.type) ? "series" : "movie";
-
-        Toast.makeText(
-                this,
-                "匹配到：" +
-                        (TextUtils.isEmpty(result.name) ? info.title : result.name) +
-                        (result.year == null ? "" : " (" + result.year + ")") +
-                        "\nIMDb: " + result.imdbId,
-                Toast.LENGTH_SHORT
-        ).show();
-
-        if (nuvio) {
-            launchNuvio(type, result.imdbId);
-        } else if ("series".equals(type)) {
-            // Stremio's documented series detail format accepts the IMDb
-            // meta id; an episode video id is only required when opening an
-            // exact episode.
-            launch("stremio:///detail/series/" + result.imdbId,
-                    "没有检测到 Stremio");
-        } else {
-            launch("stremio:///detail/movie/" + result.imdbId +
-                            "/" + result.imdbId,
-                    "没有检测到 Stremio");
-        }
-    }
-
-    private void launchNuvio(String type, String imdbId) {
-        // Use Nuvio's own canonical meta deep-link format.
-        String uri = "nuvio://meta?type=" + Uri.encode(type) +
-                "&id=" + Uri.encode(imdbId);
-
-        Intent probe = new Intent(Intent.ACTION_VIEW, Uri.parse(uri));
-        android.content.pm.ResolveInfo resolved = null;
-        try {
-            resolved = getPackageManager().resolveActivity(probe, 0);
-        } catch (Throwable ignored) {
-        }
-
-        if (resolved == null || resolved.activityInfo == null) {
-            // Fallback for older Nuvio versions.
-            uri = "nuvio://" + type + "/" + imdbId;
-            probe = new Intent(Intent.ACTION_VIEW, Uri.parse(uri));
-            try {
-                resolved = getPackageManager().resolveActivity(probe, 0);
-            } catch (Throwable ignored) {
-            }
-        }
-
-        if (resolved == null || resolved.activityInfo == null) {
-            Toast.makeText(
-                    this,
-                    "没有检测到可处理该链接的 Nuvio 版本",
-                    Toast.LENGTH_LONG
-            ).show();
-            return;
-        }
-
-        Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(uri));
-        intent.setClassName(
-                resolved.activityInfo.packageName,
-                resolved.activityInfo.name
-        );
-
-        // Reliable mode:
-        // Nuvio handles cold-start deep links in onCreate reliably, while
-        // repeated warm onNewIntent delivery can race with its StateFlow-based
-        // pendingDeepLink state. Rebuilding only Nuvio's Activity task avoids
-        // that race without force-stopping the process or clearing app data.
-        intent.addFlags(
-                Intent.FLAG_ACTIVITY_NEW_TASK |
-                Intent.FLAG_ACTIVITY_CLEAR_TASK
-        );
-
-        try {
-            startActivity(intent);
-        } catch (Throwable firstError) {
-            // Some OEMs are stricter about CLEAR_TASK across packages.
-            // Fall back to a normal explicit deep-link launch.
-            try {
-                Intent fallback = new Intent(Intent.ACTION_VIEW, Uri.parse(uri));
-                fallback.setPackage(resolved.activityInfo.packageName);
-                fallback.addFlags(
-                        Intent.FLAG_ACTIVITY_NEW_TASK |
-                        Intent.FLAG_ACTIVITY_CLEAR_TOP |
-                        Intent.FLAG_ACTIVITY_SINGLE_TOP
-                );
-                startActivity(fallback);
-            } catch (Throwable secondError) {
-                Toast.makeText(
-                        this,
-                        "Nuvio 跳转失败：" +
-                                secondError.getClass().getSimpleName(),
-                        Toast.LENGTH_LONG
-                ).show();
-            }
-        }
-    }
-
-    private void openStremioSearch(MediaInfo info) {
-        try {
-            String query = info.title +
-                    (info.year == null ? "" : " " + info.year);
-            String encoded = URLEncoder.encode(query, "UTF-8")
-                    .replace("+", "%20");
-            launch("stremio:///search?search=" + encoded,
-                    "没有检测到 Stremio");
-        } catch (Exception e) {
-            Toast.makeText(this, "无法生成 Stremio 搜索链接",
-                    Toast.LENGTH_LONG).show();
-        }
-    }
-
-    private void launch(String uri, String errorMessage) {
-        try {
-            Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(uri));
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            startActivity(intent);
-        } catch (ActivityNotFoundException e) {
-            Toast.makeText(this, errorMessage, Toast.LENGTH_LONG).show();
-        }
-    }
-
-    private CinemetaResolver.Result readCache(MediaInfo info) {
-        String raw = prefs().getString("r2:" + info.cacheKey(), null);
-        if (raw == null) return null;
-        String[] parts = raw.split("\\|", 4);
-        if (parts.length < 2 || !parts[0].matches("tt\\d{5,12}")) {
-            return null;
-        }
-        Integer year = null;
-        if (parts.length >= 4 && !parts[3].isEmpty()) {
-            try { year = Integer.valueOf(parts[3]); } catch (Exception ignored) {}
-        }
-        if (info.year != null && year != null &&
-                Math.abs(info.year - year) > 2) {
-            return null;
-        }
-
-        return new CinemetaResolver.Result(
-                parts[0],
-                parts[1],
-                parts.length >= 3 ? parts[2] : "",
-                year
-        );
-    }
-
-    private void writeCache(MediaInfo info, CinemetaResolver.Result result) {
-        prefs().edit().putString(
-                "r2:" + info.cacheKey(),
-                result.imdbId + "|" + result.type + "|" +
-                        (result.name == null ? "" : result.name) + "|" +
-                        (result.year == null ? "" : result.year)
-        ).apply();
-    }
-
-    private SharedPreferences prefs() {
-        return getSharedPreferences(
-                "douban_player_bridge_cache",
-                Context.MODE_PRIVATE);
     }
 
     private void hideOverlay() {
         main.removeCallbacks(scanRunnable);
         main.removeCallbacks(hideRunnable);
+
         if (overlay != null && windowManager != null) {
             try {
                 windowManager.removeView(overlay);
-            } catch (Throwable ignored) {
-            }
+            } catch (Throwable ignored) {}
         }
+
         overlay = null;
+        overlayStatus = null;
         stremioButton = null;
         nuvioButton = null;
         currentInfo = null;
+        currentResolved = null;
+        currentResolveKey = null;
+        resolving = false;
     }
 
     private int dp(int value) {
