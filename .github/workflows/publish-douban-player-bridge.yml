@@ -15,7 +15,7 @@ jobs:
     env:
       ANDROID_HOME: /usr/local/lib/android/sdk
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
-      VERSION: "0.2.0"
+      VERSION: "0.2.1"
 
     steps:
       - name: Checkout
