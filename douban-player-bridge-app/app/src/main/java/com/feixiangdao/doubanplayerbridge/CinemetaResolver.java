@@ -44,10 +44,19 @@ final class CinemetaResolver {
 
     static Result resolve(MediaInfo info) throws Exception {
         LinkedHashSet<String> queries = new LinkedHashSet<>();
-        if (!TextUtils.isEmpty(info.title)) queries.add(info.title.trim());
+        if (!TextUtils.isEmpty(info.title)) {
+            if (info.year != null) {
+                queries.add(info.title.trim() + " " + info.year);
+            }
+            queries.add(info.title.trim());
+        }
         for (String alias : info.aliases) {
-            if (!TextUtils.isEmpty(alias)) queries.add(alias.trim());
-            if (queries.size() >= 4) break;
+            if (TextUtils.isEmpty(alias)) continue;
+            if (info.year != null) {
+                queries.add(alias.trim() + " " + info.year);
+            }
+            queries.add(alias.trim());
+            if (queries.size() >= 6) break;
         }
         if (queries.isEmpty()) return null;
 
@@ -59,12 +68,19 @@ final class CinemetaResolver {
         int queryIndex = 0;
 
         for (String query : queries) {
-            if (queryIndex++ >= 3) break;
+            if (queryIndex++ >= 5) break;
 
             for (String type : order) {
                 List<Candidate> list = search(type, query);
                 for (int rank = 0; rank < list.size(); rank++) {
                     Candidate c = list.get(rank);
+
+                    // Fail closed on an obvious release-year mismatch.
+                    if (info.year != null && c.year != null &&
+                            Math.abs(info.year - c.year) > 2) {
+                        continue;
+                    }
+
                     c.score = score(c, query, info, type, rank);
                     if (best == null || c.score > best.score) best = c;
                 }
@@ -73,7 +89,7 @@ final class CinemetaResolver {
             if (best != null && best.score >= 125) break;
         }
 
-        if (best == null || best.score < 50) return null;
+        if (best == null || best.score < 80) return null;
         return new Result(best.imdbId, best.type, best.name, best.year);
     }
 
@@ -154,7 +170,7 @@ final class CinemetaResolver {
             if (delta == 0) score += 60;
             else if (delta == 1) score += 30;
             else if (delta <= 2) score += 10;
-            else score -= 25;
+            else return Integer.MIN_VALUE / 4;
         }
 
         if (requestedType.equals(c.type)) score += 15;
