@@ -3,17 +3,16 @@ package app.playerbridge.patches.douban
 import app.morphe.patcher.Fingerprint
 
 /**
- * Douban 7.135.0 is protected by the NetEase NIS wrapper, so the real
- * MovieActivity2 bytecode is not present in the APK on disk.
+ * Douban 7.135.0 is protected by the NetEase NIS wrapper.
  *
- * Instead we inject into the wrapper's Instrumentation proxy. At runtime it
- * receives the real Activity instance after the protected classes are loaded.
+ * We hook the wrapper Application instead of InstrumentationProxy so the
+ * protected startup sequence can finish before any bridge code is loaded.
  */
-object DoubanActivityCreateFingerprint : Fingerprint(
+object DoubanApplicationOnCreateFingerprint : Fingerprint(
     returnType = "V",
     custom = { method, classDef ->
-        classDef.type ==
-            "Lcom/netease/nis/wrapper/plugin/InstrumentationProxy;" &&
-            method.name == "callActivityOnCreate"
+        classDef.type == "Lcom/netease/nis/wrapper/MyApplication;" &&
+            method.name == "onCreate" &&
+            method.parameterTypes.isEmpty()
     },
 )
