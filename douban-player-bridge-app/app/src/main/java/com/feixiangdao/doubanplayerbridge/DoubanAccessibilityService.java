@@ -222,8 +222,9 @@ public class DoubanAccessibilityService extends AccessibilityService {
             }
         }
 
+        final NodeText bestNode = best;
         nearby.sort(Comparator.comparingInt(a ->
-                Math.abs(a.bounds.centerY() - best.bounds.centerY())));
+                Math.abs(a.bounds.centerY() - bestNode.bounds.centerY())));
 
         for (NodeText e : nearby) {
             String alias = cleanTitle(e.text);
