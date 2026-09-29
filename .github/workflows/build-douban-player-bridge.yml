@@ -46,12 +46,12 @@ jobs:
       - name: Prepare artifact
         run: |
           mkdir -p dist
-          cp douban-player-bridge-app/app/build/outputs/apk/debug/app-debug.apk              dist/DoubanPlayerBridge-0.2.1.apk
-          sha256sum dist/DoubanPlayerBridge-0.2.1.apk
+          cp douban-player-bridge-app/app/build/outputs/apk/debug/app-debug.apk              dist/DoubanPlayerBridge-0.2.2.apk
+          sha256sum dist/DoubanPlayerBridge-0.2.2.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: DoubanPlayerBridge-0.2.1
-          path: dist/DoubanPlayerBridge-0.2.1.apk
+          name: DoubanPlayerBridge-0.2.2
+          path: dist/DoubanPlayerBridge-0.2.2.apk
           if-no-files-found: error
