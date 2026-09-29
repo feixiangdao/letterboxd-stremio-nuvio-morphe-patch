@@ -551,26 +551,75 @@ public class DoubanAccessibilityService extends AccessibilityService {
     }
 
     private void launchNuvio(String type, String imdbId) {
-        // Current Nuvio parsers support provider-specific and legacy forms.
-        String[] candidates = {
-                "nuvio://imdb/" + type + "/" + imdbId,
-                "nuvio://" + type + "/" + imdbId
-        };
+        // Use Nuvio's own canonical meta deep-link format.
+        String uri = "nuvio://meta?type=" + Uri.encode(type) +
+                "&id=" + Uri.encode(imdbId);
 
-        for (String uri : candidates) {
-            Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(uri));
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        Intent probe = new Intent(Intent.ACTION_VIEW, Uri.parse(uri));
+        android.content.pm.ResolveInfo resolved = null;
+        try {
+            resolved = getPackageManager().resolveActivity(probe, 0);
+        } catch (Throwable ignored) {
+        }
+
+        if (resolved == null || resolved.activityInfo == null) {
+            // Fallback for older Nuvio versions.
+            uri = "nuvio://" + type + "/" + imdbId;
+            probe = new Intent(Intent.ACTION_VIEW, Uri.parse(uri));
             try {
-                if (intent.resolveActivity(getPackageManager()) != null) {
-                    startActivity(intent);
-                    return;
-                }
+                resolved = getPackageManager().resolveActivity(probe, 0);
             } catch (Throwable ignored) {
             }
         }
 
-        // Last attempt lets Android's dispatcher handle unusual Nuvio builds.
-        launch(candidates[1], "没有检测到可处理该链接的 Nuvio 版本");
+        if (resolved == null || resolved.activityInfo == null) {
+            Toast.makeText(
+                    this,
+                    "没有检测到可处理该链接的 Nuvio 版本",
+                    Toast.LENGTH_LONG
+            ).show();
+            return;
+        }
+
+        Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(uri));
+        intent.setClassName(
+                resolved.activityInfo.packageName,
+                resolved.activityInfo.name
+        );
+
+        // Reliable mode:
+        // Nuvio handles cold-start deep links in onCreate reliably, while
+        // repeated warm onNewIntent delivery can race with its StateFlow-based
+        // pendingDeepLink state. Rebuilding only Nuvio's Activity task avoids
+        // that race without force-stopping the process or clearing app data.
+        intent.addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK |
+                Intent.FLAG_ACTIVITY_CLEAR_TASK
+        );
+
+        try {
+            startActivity(intent);
+        } catch (Throwable firstError) {
+            // Some OEMs are stricter about CLEAR_TASK across packages.
+            // Fall back to a normal explicit deep-link launch.
+            try {
+                Intent fallback = new Intent(Intent.ACTION_VIEW, Uri.parse(uri));
+                fallback.setPackage(resolved.activityInfo.packageName);
+                fallback.addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK |
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP |
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP
+                );
+                startActivity(fallback);
+            } catch (Throwable secondError) {
+                Toast.makeText(
+                        this,
+                        "Nuvio 跳转失败：" +
+                                secondError.getClass().getSimpleName(),
+                        Toast.LENGTH_LONG
+                ).show();
+            }
+        }
     }
 
     private void openStremioSearch(MediaInfo info) {
