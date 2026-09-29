@@ -41,6 +41,9 @@ import java.util.regex.Pattern;
 public class DoubanAccessibilityService extends AccessibilityService {
     private static final String TAG = "DoubanPlayerBridge";
     private static final String DOUBAN_PACKAGE = "com.douban.frodo";
+    private static final String SELF_PACKAGE =
+            "com.feixiangdao.doubanplayerbridge";
+    private static final long HIDE_GRACE_MS = 2200L;
 
     private static final Pattern YEAR =
             Pattern.compile("(?:\\(|（)?\\b((?:18|19|20)\\d{2})\\b(?:\\)|）)?");
@@ -65,6 +68,8 @@ public class DoubanAccessibilityService extends AccessibilityService {
     private String lastDoubanWindowClass;
 
     private final Runnable scanRunnable = this::scanCurrentWindow;
+    private final Runnable hideRunnable = this::hideOverlay;
+    private long lastDoubanEventAt = 0L;
 
     @Override
     protected void onServiceConnected() {
@@ -80,20 +85,36 @@ public class DoubanAccessibilityService extends AccessibilityService {
         CharSequence pkgCs = event.getPackageName();
         String pkg = pkgCs == null ? "" : pkgCs.toString();
 
-        if (!DOUBAN_PACKAGE.equals(pkg)) {
-            hideOverlay();
+        // AccessibilityOverlay interactions can generate events belonging to
+        // this helper app. Never treat those as "left Douban".
+        if (SELF_PACKAGE.equals(pkg)) {
             return;
         }
 
-        if (event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            CharSequence cls = event.getClassName();
-            if (cls != null) {
-                lastDoubanWindowClass = cls.toString();
+        if (DOUBAN_PACKAGE.equals(pkg)) {
+            lastDoubanEventAt = android.os.SystemClock.uptimeMillis();
+            main.removeCallbacks(hideRunnable);
+
+            if (event.getEventType() ==
+                    AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                CharSequence cls = event.getClassName();
+                if (cls != null) {
+                    lastDoubanWindowClass = cls.toString();
+                }
             }
+
+            main.removeCallbacks(scanRunnable);
+            main.postDelayed(scanRunnable, 300);
+            return;
         }
 
-        main.removeCallbacks(scanRunnable);
-        main.postDelayed(scanRunnable, 280);
+        // Ignore transient content events from keyboards/system overlays.
+        // Only a real window switch away from Douban starts a delayed hide.
+        if (event.getEventType() ==
+                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            main.removeCallbacks(hideRunnable);
+            main.postDelayed(hideRunnable, HIDE_GRACE_MS);
+        }
     }
 
     @Override
@@ -111,7 +132,7 @@ public class DoubanAccessibilityService extends AccessibilityService {
     private void scanCurrentWindow() {
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) {
-            hideOverlay();
+            scheduleGracefulHide();
             return;
         }
 
@@ -120,16 +141,30 @@ public class DoubanAccessibilityService extends AccessibilityService {
         collect(root, entries, counter, 0);
 
         if (!isMovieDetail(entries)) {
-            hideOverlay();
+            // Douban frequently rebuilds portions of the accessibility tree
+            // while scrolling/loading. Keep a currently visible overlay alive
+            // during these short gaps instead of flickering.
+            if (overlay != null) {
+                scheduleGracefulHide();
+            } else {
+                hideOverlay();
+            }
             return;
         }
 
         MediaInfo info = extractMediaInfo(entries);
         if (info == null || TextUtils.isEmpty(info.title)) {
-            hideOverlay();
+            // Preserve the last good media identity during a transient tree
+            // refresh. A later valid scan will replace it.
+            if (overlay != null && currentInfo != null) {
+                main.removeCallbacks(hideRunnable);
+            } else {
+                scheduleGracefulHide();
+            }
             return;
         }
 
+        main.removeCallbacks(hideRunnable);
         currentInfo = info;
         showOrUpdateOverlay(info);
     }
@@ -353,6 +388,14 @@ public class DoubanAccessibilityService extends AccessibilityService {
         }
     }
 
+    private void scheduleGracefulHide() {
+        main.removeCallbacks(hideRunnable);
+
+        long elapsed = android.os.SystemClock.uptimeMillis() - lastDoubanEventAt;
+        long delay = elapsed < 1200L ? HIDE_GRACE_MS : 1200L;
+        main.postDelayed(hideRunnable, delay);
+    }
+
     private void showOrUpdateOverlay(MediaInfo info) {
         if (windowManager == null) return;
 
@@ -482,10 +525,22 @@ public class DoubanAccessibilityService extends AccessibilityService {
             MediaInfo info
     ) {
         String type = "series".equals(result.type) ? "series" : "movie";
+
+        Toast.makeText(
+                this,
+                "匹配到：" +
+                        (TextUtils.isEmpty(result.name) ? info.title : result.name) +
+                        (result.year == null ? "" : " (" + result.year + ")") +
+                        "\nIMDb: " + result.imdbId,
+                Toast.LENGTH_SHORT
+        ).show();
+
         if (nuvio) {
-            launch("nuvio://" + type + "/" + result.imdbId,
-                    "没有检测到 Nuvio");
+            launchNuvio(type, result.imdbId);
         } else if ("series".equals(type)) {
+            // Stremio's documented series detail format accepts the IMDb
+            // meta id; an episode video id is only required when opening an
+            // exact episode.
             launch("stremio:///detail/series/" + result.imdbId,
                     "没有检测到 Stremio");
         } else {
@@ -493,6 +548,29 @@ public class DoubanAccessibilityService extends AccessibilityService {
                             "/" + result.imdbId,
                     "没有检测到 Stremio");
         }
+    }
+
+    private void launchNuvio(String type, String imdbId) {
+        // Current Nuvio parsers support provider-specific and legacy forms.
+        String[] candidates = {
+                "nuvio://imdb/" + type + "/" + imdbId,
+                "nuvio://" + type + "/" + imdbId
+        };
+
+        for (String uri : candidates) {
+            Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(uri));
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            try {
+                if (intent.resolveActivity(getPackageManager()) != null) {
+                    startActivity(intent);
+                    return;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        // Last attempt lets Android's dispatcher handle unusual Nuvio builds.
+        launch(candidates[1], "没有检测到可处理该链接的 Nuvio 版本");
     }
 
     private void openStremioSearch(MediaInfo info) {
@@ -510,7 +588,6 @@ public class DoubanAccessibilityService extends AccessibilityService {
     }
 
     private void launch(String uri, String errorMessage) {
-        hideOverlay();
         try {
             Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(uri));
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
@@ -556,6 +633,7 @@ public class DoubanAccessibilityService extends AccessibilityService {
 
     private void hideOverlay() {
         main.removeCallbacks(scanRunnable);
+        main.removeCallbacks(hideRunnable);
         if (overlay != null && windowManager != null) {
             try {
                 windowManager.removeView(overlay);
