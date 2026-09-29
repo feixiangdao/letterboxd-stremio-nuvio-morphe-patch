@@ -46,7 +46,11 @@ public class DoubanAccessibilityService extends AccessibilityService {
     private static final String NUVIO_PACKAGE = "com.nuvio.app";
     private static final String NUVIO_ACTIVITY = "com.nuvio.app.MainActivity";
 
-    private static final long HIDE_GRACE_MS = 2600L;
+    // A real app switch should remove the overlay almost immediately.
+    // A transient Douban accessibility-tree refresh gets a separate grace
+    // window to avoid the old flicker problem.
+    private static final long EXTERNAL_APP_HIDE_MS = 120L;
+    private static final long TREE_REFRESH_HIDE_MS = 900L;
 
     private static final Pattern YEAR =
             Pattern.compile("(?:\\(|（)?\\b((?:18|19|20)\\d{2})\\b(?:\\)|）)?");
@@ -120,7 +124,7 @@ public class DoubanAccessibilityService extends AccessibilityService {
         if (event.getEventType() ==
                 AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             main.removeCallbacks(hideRunnable);
-            main.postDelayed(hideRunnable, HIDE_GRACE_MS);
+            main.postDelayed(hideRunnable, EXTERNAL_APP_HIDE_MS);
         }
     }
 
@@ -553,6 +557,10 @@ public class DoubanAccessibilityService extends AccessibilityService {
                 Intent.FLAG_ACTIVITY_CLEAR_TASK
         );
 
+        // The destination app is about to take over the screen, so remove the
+        // overlay now instead of waiting for accessibility window events.
+        hideOverlay();
+
         try {
             startActivity(intent);
         } catch (Throwable first) {
@@ -590,6 +598,7 @@ public class DoubanAccessibilityService extends AccessibilityService {
         }
 
         base.setPackage(packageName);
+        hideOverlay();
         try {
             startActivity(base);
         } catch (Throwable error) {
@@ -938,7 +947,7 @@ public class DoubanAccessibilityService extends AccessibilityService {
         main.removeCallbacks(hideRunnable);
 
         long elapsed = android.os.SystemClock.uptimeMillis() - lastDoubanEventAt;
-        long delay = elapsed < 1200L ? HIDE_GRACE_MS : 1400L;
+        long delay = elapsed < 1200L ? TREE_REFRESH_HIDE_MS : 550L;
         main.postDelayed(hideRunnable, delay);
     }
 
