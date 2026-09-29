@@ -54,7 +54,9 @@ public class DoubanAccessibilityService extends AccessibilityService {
                 "豆瓣", "首页", "书影音", "广播", "小组", "市集", "我的",
                 "想看", "看过", "短评", "影评", "讨论", "简介", "演职员",
                 "预告片", "剧照", "评分", "更多", "全部", "展开", "收起",
-                "分享", "写短评", "写影评", "举报", "Stremio", "Nuvio");
+                "分享", "写短评", "写影评", "举报", "Stremio", "Nuvio",
+                "电影", "电视剧", "剧集", "综艺", "纪录片", "动画",
+                "热门电影", "热门电视剧", "全部电影", "全部电视剧");
     }
 
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -196,6 +198,17 @@ public class DoubanAccessibilityService extends AccessibilityService {
         DisplayMetrics dm = getResources().getDisplayMetrics();
         int screenHeight = dm.heightPixels;
 
+        List<NodeText> yearAnchors = new ArrayList<>();
+        for (NodeText entry : entries) {
+            if (entry.bounds.centerY() <= 0 ||
+                    entry.bounds.centerY() > screenHeight * 0.60) {
+                continue;
+            }
+            if (parseYear(entry.text) != null) {
+                yearAnchors.add(entry);
+            }
+        }
+
         NodeText best = null;
         int bestScore = Integer.MIN_VALUE;
 
@@ -213,11 +226,30 @@ public class DoubanAccessibilityService extends AccessibilityService {
 
             int y = entry.bounds.centerY();
             int h = entry.bounds.height();
+            int w = entry.bounds.width();
 
             if (y > 0 && y < screenHeight * 0.50) score += 45;
             if (y > 0 && y < screenHeight * 0.32) score += 25;
 
-            score += Math.min(60, Math.max(0, h));
+            // The real Douban title is typically immediately above/next to
+            // the "(YYYY)" node. Give that spatial relationship the strongest
+            // weight so generic strings such as "电影" cannot win.
+            int nearestYearDistance = Integer.MAX_VALUE;
+            for (NodeText anchor : yearAnchors) {
+                nearestYearDistance = Math.min(
+                        nearestYearDistance,
+                        Math.abs(anchor.bounds.centerY() - y)
+                );
+            }
+            if (nearestYearDistance != Integer.MAX_VALUE) {
+                if (nearestYearDistance <= screenHeight * 0.055) score += 150;
+                else if (nearestYearDistance <= screenHeight * 0.10) score += 90;
+                else if (nearestYearDistance <= screenHeight * 0.16) score += 35;
+                else score -= 30;
+            }
+
+            score += Math.min(65, Math.max(0, h));
+            score += Math.min(45, Math.max(0, w / 6));
 
             int len = cleaned.length();
             if (len >= 2 && len <= 40) score += 25;
@@ -647,7 +679,7 @@ public class DoubanAccessibilityService extends AccessibilityService {
     }
 
     private CinemetaResolver.Result readCache(MediaInfo info) {
-        String raw = prefs().getString("r:" + info.cacheKey(), null);
+        String raw = prefs().getString("r2:" + info.cacheKey(), null);
         if (raw == null) return null;
         String[] parts = raw.split("\\|", 4);
         if (parts.length < 2 || !parts[0].matches("tt\\d{5,12}")) {
@@ -657,6 +689,11 @@ public class DoubanAccessibilityService extends AccessibilityService {
         if (parts.length >= 4 && !parts[3].isEmpty()) {
             try { year = Integer.valueOf(parts[3]); } catch (Exception ignored) {}
         }
+        if (info.year != null && year != null &&
+                Math.abs(info.year - year) > 2) {
+            return null;
+        }
+
         return new CinemetaResolver.Result(
                 parts[0],
                 parts[1],
@@ -667,7 +704,7 @@ public class DoubanAccessibilityService extends AccessibilityService {
 
     private void writeCache(MediaInfo info, CinemetaResolver.Result result) {
         prefs().edit().putString(
-                "r:" + info.cacheKey(),
+                "r2:" + info.cacheKey(),
                 result.imdbId + "|" + result.type + "|" +
                         (result.name == null ? "" : result.name) + "|" +
                         (result.year == null ? "" : result.year)
