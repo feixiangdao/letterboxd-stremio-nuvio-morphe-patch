@@ -77,6 +77,10 @@ public class MainActivity extends Activity {
         saveKey.setOnClickListener(v -> saveTmdbKey());
         root.addView(saveKey, matchWrapWithTop(8));
 
+        Button testKey = button("验证 TMDB Key");
+        testKey.setOnClickListener(v -> testTmdbKey(testKey));
+        root.addView(testKey, matchWrapWithTop(6));
+
         tmdbStatusView = text("", 14, true);
         tmdbStatusView.setPadding(0, dp(8), 0, 0);
         root.addView(tmdbStatusView);
@@ -92,7 +96,7 @@ public class MainActivity extends Activity {
 
         TextView instructions = text(
                 "使用方法\n\n" +
-                "① 保存 TMDB Key。\n" +
+                "① 填写并验证 TMDB Key。\n" +
                 "② 开启“豆瓣播放器桥接”无障碍服务。\n" +
                 "③ 正常打开官方豆瓣 App。\n" +
                 "④ 进入电影或电视剧详情页。\n" +
@@ -118,8 +122,6 @@ public class MainActivity extends Activity {
         String key = tmdbKeyInput.getText().toString().trim();
         settings().edit().putString(TMDB_CREDENTIAL_KEY, key).apply();
 
-        // Resolver cache is deliberately cleared when credentials/settings are
-        // changed so an old bad mapping can never survive a configuration fix.
         getSharedPreferences("douban_player_bridge_cache", MODE_PRIVATE)
                 .edit().clear().apply();
 
@@ -129,6 +131,57 @@ public class MainActivity extends Activity {
                 TextUtils.isEmpty(key) ? "已清除 TMDB 设置" : "TMDB 设置已保存",
                 Toast.LENGTH_SHORT
         ).show();
+    }
+
+    private void testTmdbKey(Button button) {
+        String key = tmdbKeyInput.getText().toString().trim();
+        if (TextUtils.isEmpty(key)) {
+            Toast.makeText(this, "请先输入 TMDB Key / Token", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        button.setEnabled(false);
+        tmdbStatusView.setText("TMDB：正在验证…");
+        tmdbStatusView.setTextColor(Color.DKGRAY);
+
+        new Thread(() -> {
+            boolean ok = false;
+            String error = null;
+            try {
+                ok = TmdbResolver.testCredential(key);
+            } catch (Throwable t) {
+                error = t.getMessage();
+                if (TextUtils.isEmpty(error)) {
+                    error = t.getClass().getSimpleName();
+                }
+            }
+
+            final boolean success = ok;
+            final String failure = error;
+            runOnUiThread(() -> {
+                button.setEnabled(true);
+                if (success) {
+                    settings().edit()
+                            .putString(TMDB_CREDENTIAL_KEY, key)
+                            .apply();
+                    getSharedPreferences(
+                            "douban_player_bridge_cache",
+                            MODE_PRIVATE
+                    ).edit().clear().apply();
+
+                    tmdbStatusView.setText("TMDB：连接正常 ✓");
+                    tmdbStatusView.setTextColor(Color.rgb(0, 140, 60));
+                } else {
+                    tmdbStatusView.setText(
+                            "TMDB：验证失败" +
+                                    (TextUtils.isEmpty(failure)
+                                            ? ""
+                                            : " · " + failure)
+                    );
+                    tmdbStatusView.setTextColor(Color.rgb(180, 45, 45));
+                }
+            });
+        }, "TmdbCredentialTest").start();
     }
 
     private void refreshStatus() {
