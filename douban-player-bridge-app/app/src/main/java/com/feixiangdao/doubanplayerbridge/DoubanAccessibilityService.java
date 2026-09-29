@@ -56,6 +56,8 @@ public class DoubanAccessibilityService extends AccessibilityService {
             Pattern.compile("(?:\\(|（)?\\b((?:18|19|20)\\d{2})\\b(?:\\)|）)?");
     private static final Pattern EXACT_YEAR =
             Pattern.compile("^[（(]?((?:18|19|20)\\d{2})[）)]?$");
+    private static final Pattern TITLE_WITH_TRAILING_YEAR =
+            Pattern.compile("^(.+?)\\s*[（(]((?:18|19|20)\\d{2})[）)]$");
 
     private static final Set<String> EXACT_REJECT = new HashSet<>();
     static {
@@ -213,6 +215,112 @@ public class DoubanAccessibilityService extends AccessibilityService {
         int screenHeight = dm.heightPixels;
         int maxTitleArea = (int) (screenHeight * 0.52f);
 
+        /*
+         * Douban commonly exposes two title layouts:
+         *
+         *   好久没做
+         *   LTNS (2024)
+         *
+         * or:
+         *
+         *   奥德赛
+         *   The Odyssey (2026)
+         *
+         * TITLE_WITH_TRAILING_YEAR is a much stronger signal than generic
+         * labels such as "喜剧类韩剧榜", so always prefer it when present.
+         */
+        NodeText inlineTitleYearNode = null;
+        String inlineAlias = null;
+        Integer inlineYear = null;
+        int inlineScore = Integer.MIN_VALUE;
+
+        for (NodeText entry : entries) {
+            int y = entry.bounds.centerY();
+            if (y <= 0 || y > maxTitleArea) continue;
+
+            Matcher matcher = TITLE_WITH_TRAILING_YEAR.matcher(entry.text.trim());
+            if (!matcher.matches()) continue;
+
+            String titlePart = matcher.group(1).trim();
+            if (!looksLikeTitle(titlePart)) continue;
+
+            int score = 500;
+            score += Math.min(100, entry.bounds.height() * 2);
+            score += Math.min(70, entry.bounds.width() / 5);
+            if (y < screenHeight * 0.35f) score += 60;
+
+            String id = entry.viewId == null ? "" :
+                    entry.viewId.toLowerCase(Locale.US);
+            if (id.contains("title")) score += 100;
+            if (id.contains("subject")) score += 30;
+
+            if (score > inlineScore) {
+                inlineScore = score;
+                inlineTitleYearNode = entry;
+                inlineAlias = titlePart;
+                try {
+                    inlineYear = Integer.valueOf(matcher.group(2));
+                } catch (Exception ignored) {
+                    inlineYear = null;
+                }
+            }
+        }
+
+        if (inlineTitleYearNode != null) {
+            NodeText primary = null;
+            int primaryScore = Integer.MIN_VALUE;
+
+            for (NodeText candidate : entries) {
+                if (candidate == inlineTitleYearNode) continue;
+
+                int cy = candidate.bounds.centerY();
+                if (cy <= 0 || cy >= inlineTitleYearNode.bounds.centerY()) continue;
+
+                int verticalGap =
+                        inlineTitleYearNode.bounds.top - candidate.bounds.bottom;
+                if (verticalGap < -dp(18) || verticalGap > dp(130)) continue;
+
+                int horizontal = Math.abs(
+                        candidate.bounds.left - inlineTitleYearNode.bounds.left);
+                if (horizontal > dm.widthPixels * 0.45f) continue;
+
+                String value = cleanTitle(candidate.text);
+                if (!looksLikeTitle(value)) continue;
+                if (isLikelySectionOrRankingLabel(value)) continue;
+
+                int score = 260;
+                score -= Math.max(0, verticalGap);
+                score -= horizontal / 5;
+                score += Math.min(100, candidate.bounds.height() * 2);
+                score += Math.min(60, candidate.bounds.width() / 5);
+
+                String id = candidate.viewId == null ? "" :
+                        candidate.viewId.toLowerCase(Locale.US);
+                if (id.contains("title")) score += 100;
+                if (id.contains("subject")) score += 30;
+
+                if (score > primaryScore) {
+                    primaryScore = score;
+                    primary = candidate;
+                }
+            }
+
+            MediaInfo info = new MediaInfo();
+            info.title = primary != null
+                    ? cleanTitle(primary.text)
+                    : inlineAlias;
+            info.year = inlineYear;
+
+            if (!TextUtils.isEmpty(inlineAlias) &&
+                    !inlineAlias.equals(info.title)) {
+                info.aliases.add(inlineAlias);
+            }
+
+            info.preferredType = detectMediaType(entries);
+            return info;
+        }
+
+        // Older/alternate layout: title and "(YYYY)" are separate nodes.
         List<NodeText> yearAnchors = new ArrayList<>();
         for (NodeText entry : entries) {
             int y = entry.bounds.centerY();
@@ -230,8 +338,10 @@ public class DoubanAccessibilityService extends AccessibilityService {
         for (NodeText anchor : yearAnchors) {
             for (NodeText candidate : entries) {
                 if (candidate == anchor) continue;
+
                 String title = cleanTitle(candidate.text);
                 if (!looksLikeTitle(title)) continue;
+                if (isLikelySectionOrRankingLabel(title)) continue;
 
                 int cy = candidate.bounds.centerY();
                 if (cy <= 0 || cy >= anchor.bounds.centerY()) continue;
@@ -263,6 +373,7 @@ public class DoubanAccessibilityService extends AccessibilityService {
             if (bestTitle != null) break;
         }
 
+        // Last-resort fallback. Ranking/section labels are excluded here too.
         if (bestTitle == null) {
             for (NodeText entry : entries) {
                 int y = entry.bounds.centerY();
@@ -270,6 +381,7 @@ public class DoubanAccessibilityService extends AccessibilityService {
 
                 String title = cleanTitle(entry.text);
                 if (!looksLikeTitle(title)) continue;
+                if (isLikelySectionOrRankingLabel(title)) continue;
 
                 String id = entry.viewId == null ? "" :
                         entry.viewId.toLowerCase(Locale.US);
@@ -278,6 +390,11 @@ public class DoubanAccessibilityService extends AccessibilityService {
                 if (id.contains("title")) score += 240;
                 if (id.contains("subject")) score += 70;
                 if (id.contains("name")) score += 35;
+
+                // A node that itself contains a year is much more likely to be
+                // the actual title than a badge/list label.
+                if (parseYear(entry.text) != null) score += 180;
+
                 score += Math.min(95, entry.bounds.height() * 2);
                 score += Math.min(55, entry.bounds.width() / 6);
                 if (y < screenHeight * 0.35f) score += 45;
@@ -301,44 +418,36 @@ public class DoubanAccessibilityService extends AccessibilityService {
             info.year = parseYear(yearAnchors.get(0).text);
         }
 
-        final NodeText titleNode = bestTitle;
-        List<NodeText> nearby = new ArrayList<>();
+        info.preferredType = detectMediaType(entries);
+        return info;
+    }
 
-        for (NodeText entry : entries) {
-            if (entry == bestTitle || entry == bestYear) continue;
-
-            int y = entry.bounds.centerY();
-            if (y <= 0 || y > screenHeight * 0.56f) continue;
-            if (Math.abs(y - bestTitle.bounds.centerY()) > dp(155)) continue;
-
-            String value = cleanTitle(entry.text);
-            if (!looksLikeTitle(value) || value.equals(info.title)) continue;
-            if (EXACT_YEAR.matcher(entry.text.trim()).matches()) continue;
-
-            nearby.add(entry);
-        }
-
-        nearby.sort(Comparator.comparingInt(a ->
-                Math.abs(a.bounds.centerY() - titleNode.bounds.centerY())));
-
-        for (NodeText entry : nearby) {
-            String value = cleanTitle(entry.text);
-            if (!info.aliases.contains(value)) info.aliases.add(value);
-            if (info.aliases.size() >= 4) break;
-        }
-
-        boolean series = false;
+    private String detectMediaType(List<NodeText> entries) {
         for (NodeText entry : entries) {
             String t = entry.text;
             if (t.contains("集数") || t.contains("单集片长") ||
                     t.contains("季数") || t.contains("电视剧") ||
                     t.contains("剧集")) {
-                series = true;
-                break;
+                return "series";
             }
         }
-        info.preferredType = series ? "series" : "movie";
-        return info;
+        return "movie";
+    }
+
+    private boolean isLikelySectionOrRankingLabel(String value) {
+        if (TextUtils.isEmpty(value)) return true;
+
+        String s = value.trim();
+        String lower = s.toLowerCase(Locale.US);
+
+        return s.contains("榜") ||
+                s.contains("热门") ||
+                s.contains("评分最高") ||
+                s.contains("最值得期待") ||
+                s.contains("豆瓣") ||
+                s.contains("人气") ||
+                lower.startsWith("no.") ||
+                lower.startsWith("no。");
     }
 
     private void beginPreResolve(MediaInfo info) {
